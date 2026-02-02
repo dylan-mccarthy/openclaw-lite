@@ -13,8 +13,6 @@ dist/
 .env.production
 .env.development
 .env.test
-.env.example
-.env*.example
 *.env
 
 # Credentials directory
