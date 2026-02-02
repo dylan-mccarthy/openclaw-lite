@@ -1,0 +1,45 @@
+{
+  "name": "openclaw-lite",
+  "version": "0.1.0",
+  "description": "Minimal OpenClaw for local LLMs with context management and security",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "claw-lite": "dist/cli/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "lint": "oxlint",
+    "format": "oxfmt --write",
+    "start": "node dist/cli/cli.js"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "local",
+    "context"
+  ],
+  "author": "Dylan McCarthy",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.13.4",
+    "chalk": "^5.6.2",
+    "commander": "^12.1.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "ora": "^7.0.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.19.7",
+    "oxc-transform": "^0.15.0",
+    "oxlint": "^0.15.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}
