@@ -1,10 +1,14 @@
 import express from 'express';
 import cors from 'cors';
+import path from 'path';
 import { OllamaIntegration } from '../ollama/integration.js';
 import { FileLoader } from '../identity/file-loader.js';
 import { MemoryManager } from '../memory/memory-manager.js';
+import { ToolManager } from '../tools/tool-manager.js';
+import { OpenClawToolIntegration } from '../tools/openclaw-tool-integration.js';
 import { getConfigManager } from '../config/config.js';
 import type { Message } from '../context/types.js';
+import type { ToolCall, ToolUsageLog } from '../tools/types.js';
 
 export interface WebServerOptions {
   port?: number;
@@ -18,10 +22,13 @@ export interface WebServerOptions {
 export class WebServer {
   private app: express.Application;
   private integration: OllamaIntegration;
+  private toolIntegration: OpenClawToolIntegration | null = null;
   private fileLoader: FileLoader;
+  private toolManager: ToolManager;
   private memoryManager: MemoryManager | null = null;
   private options: Required<WebServerOptions>;
   private systemPrompt: string = '';
+  private pendingApprovals: Map<string, { call: ToolCall; resolve: (approved: boolean) => void }> = new Map();
   
   constructor(options: WebServerOptions = {}) {
     // Load default model from config
@@ -76,6 +83,31 @@ export class WebServer {
       console.warn('Failed to initialize memory manager:', error);
     }
     
+    // Initialize tool manager
+    const configPath = path.join(process.env.HOME || '.', '.clawlite', 'tool-config.json');
+    this.toolManager = new ToolManager({
+      workspacePath,
+      requireApprovalForDangerous: true,
+      maxLogSize: 1000,
+      configPath
+    });
+    
+    console.log('🔧 Tool system initialized');
+    
+    // Initialize OpenClaw-style tool integration
+    this.toolIntegration = new OpenClawToolIntegration(
+      this.toolManager,
+      {
+        baseUrl: this.options.ollamaUrl,
+        defaultModel: this.options.model,
+        temperature: 0.7,
+        maxToolCalls: 5,
+        allowDangerousTools: false,
+        requireApproval: true,
+      }
+    );
+    console.log('🤖 AI tool calling enabled (OpenClaw style)');
+    
     this.app = express();
     this.setupMiddleware();
     this.setupRoutes();
@@ -106,20 +138,198 @@ export class WebServer {
               <style>
                 body {
                   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                  max-width: 800px;
-                  margin: 0 auto;
-                  padding: 20px;
+                  margin: 0;
+                  padding: 0;
                   background: #0f172a;
                   color: #e2e8f0;
+                  display: flex;
+                  height: 100vh;
+                  overflow: hidden;
                 }
-                .header {
+                
+                /* Sidebar */
+                .sidebar {
+                  width: 300px;
+                  background: #1e293b;
+                  border-right: 1px solid #334155;
+                  display: flex;
+                  flex-direction: column;
+                  overflow: hidden;
+                }
+                
+                .sidebar-header {
+                  padding: 20px;
+                  border-bottom: 1px solid #334155;
+                }
+                
+                .sidebar-tabs {
+                  display: flex;
+                  border-bottom: 1px solid #334155;
+                }
+                
+                .sidebar-tab {
+                  flex: 1;
+                  padding: 12px;
+                  background: transparent;
+                  border: none;
+                  color: #94a3b8;
+                  cursor: pointer;
+                  font-size: 14px;
                   text-align: center;
-                  margin-bottom: 30px;
+                  transition: all 0.2s;
+                }
+                
+                .sidebar-tab:hover {
+                  background: #2d3748;
+                  color: #e2e8f0;
+                }
+                
+                .sidebar-tab.active {
+                  background: #3b82f6;
+                  color: white;
+                }
+                
+                .sidebar-content {
+                  flex: 1;
+                  overflow-y: auto;
+                  padding: 20px;
+                }
+                
+                .tab-pane {
+                  display: none;
+                }
+                
+                .tab-pane.active {
+                  display: block;
+                }
+                
+                /* Tools panel */
+                .tool-item {
+                  background: #2d3748;
+                  border-radius: 8px;
+                  padding: 12px;
+                  margin-bottom: 10px;
+                  border: 1px solid #4a5568;
+                }
+                
+                .tool-name {
+                  font-weight: bold;
+                  color: #60a5fa;
+                  margin-bottom: 4px;
+                }
+                
+                .tool-desc {
+                  font-size: 13px;
+                  color: #94a3b8;
+                  margin-bottom: 8px;
+                }
+                
+                .tool-meta {
+                  display: flex;
+                  gap: 8px;
+                  font-size: 12px;
+                }
+                
+                .tool-tag {
+                  background: #4a5568;
+                  padding: 2px 6px;
+                  border-radius: 4px;
+                }
+                
+                .tool-tag.dangerous {
+                  background: #dc2626;
+                  color: white;
+                }
+                
+                /* Activity feed */
+                .activity-item {
+                  background: #2d3748;
+                  border-radius: 8px;
+                  padding: 12px;
+                  margin-bottom: 10px;
+                  border-left: 4px solid #3b82f6;
+                }
+                
+                .activity-item.success {
+                  border-left-color: #10b981;
+                }
+                
+                .activity-item.error {
+                  border-left-color: #dc2626;
+                }
+                
+                .activity-header {
+                  display: flex;
+                  justify-content: space-between;
+                  margin-bottom: 8px;
+                }
+                
+                .activity-tool {
+                  font-weight: bold;
+                  color: #60a5fa;
+                }
+                
+                .activity-time {
+                  font-size: 12px;
+                  color: #94a3b8;
+                }
+                
+                .activity-result {
+                  font-size: 13px;
+                  color: #94a3b8;
+                  font-family: 'Monaco', 'Menlo', monospace;
+                  white-space: pre-wrap;
+                  word-break: break-all;
+                  max-height: 100px;
+                  overflow-y: auto;
+                  background: #1e293b;
+                  padding: 8px;
+                  border-radius: 4px;
+                  margin-top: 8px;
+                }
+                
+                /* File browser */
+                .file-item {
+                  display: flex;
+                  align-items: center;
+                  padding: 8px;
+                  border-radius: 6px;
+                  cursor: pointer;
+                  transition: background 0.2s;
+                }
+                
+                .file-item:hover {
+                  background: #2d3748;
+                }
+                
+                .file-icon {
+                  margin-right: 10px;
+                  font-size: 18px;
+                }
+                
+                .file-name {
+                  flex: 1;
+                }
+                
+                .file-size {
+                  font-size: 12px;
+                  color: #94a3b8;
+                }
+                
+                /* Main chat area */
+                .main-content {
+                  flex: 1;
+                  display: flex;
+                  flex-direction: column;
+                  overflow: hidden;
+                }
+                
+                .header {
                   padding: 20px;
                   background: #1e293b;
-                  border-radius: 10px;
-                  border: 1px solid #334155;
+                  border-bottom: 1px solid #334155;
                 }
+                
                 .chat-container {
                   background: #1e293b;
                   border-radius: 10px;
@@ -540,12 +750,21 @@ export class WebServer {
           model: this.options.model,
           models: health.models.length,
           memory: memoryStats || { enabled: false },
+          tools: {
+            enabled: true,
+            count: this.toolManager.listTools().length
+          },
           endpoints: {
             chat: 'POST /api/chat',
             health: 'GET /api/health',
             models: 'GET /api/models',
             session: 'GET /api/session/:id',
-            sessions: 'GET /api/sessions'
+            sessions: 'GET /api/sessions',
+            tools: 'GET /api/tools',
+            'tools/call': 'POST /api/tools/call',
+            'tools/logs': 'GET /api/tools/logs',
+            'tools/approve': 'POST /api/tools/approve/:id',
+            'tools/pending': 'GET /api/tools/pending-approvals'
           }
         });
       } catch (error) {
@@ -757,6 +976,8 @@ export class WebServer {
         const startTime = Date.now();
         
         console.log(`[WEB] Calling integration.complete()...`);
+        console.log(`[WEB] System prompt length: ${this.systemPrompt.length}`);
+        console.log(`[WEB] System prompt preview: ${this.systemPrompt.substring(0, 100)}...`);
         const result = await this.integration.complete(
           sessionMessages,
           this.systemPrompt,
@@ -972,9 +1193,332 @@ export class WebServer {
         });
       }
     });
+
+    // Tool endpoints
+    this.app.get('/api/tools', async (_req, res) => {
+      try {
+        const tools = this.toolManager.listTools();
+        return res.json({
+          tools: tools.map(tool => ({
+            name: tool.name,
+            description: tool.description,
+            category: tool.category,
+            dangerous: tool.dangerous,
+            requiresApproval: tool.requiresApproval,
+            parameters: tool.parameters
+          }))
+        });
+      } catch (error) {
+        return res.status(500).json({
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.post('/api/tools/call', async (req, res) => {
+      const { tool, args, sessionId } = req.body;
+      
+      if (!tool || typeof tool !== 'string') {
+        return res.status(400).json({ error: 'Tool name is required' });
+      }
+      
+      if (!args || typeof args !== 'object') {
+        return res.status(400).json({ error: 'Tool arguments are required' });
+      }
+      
+      try {
+        const result = await this.toolManager.callTool(tool, args, {
+          sessionId: sessionId || `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+          workspacePath: this.toolManager['options'].workspacePath,
+          requireApproval: async (call: ToolCall) => {
+            // Store the approval request
+            return new Promise((resolve) => {
+              const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+              this.pendingApprovals.set(approvalId, { call, resolve });
+              
+              // In a real implementation, this would trigger a UI notification
+              console.log(`[TOOL] Approval required for ${call.tool}:`, call.arguments);
+              console.log(`[TOOL] Approval ID: ${approvalId}`);
+              
+              // For now, auto-approve after 2 seconds
+              setTimeout(() => {
+                if (this.pendingApprovals.has(approvalId)) {
+                  console.log(`[TOOL] Auto-approving ${approvalId}`);
+                  this.pendingApprovals.delete(approvalId);
+                  resolve(true);
+                }
+              }, 2000);
+            });
+          },
+          logUsage: async (log: ToolUsageLog) => {
+            console.log(`[TOOL] ${log.call.tool}: ${log.result.success ? '✅' : '❌'} (${log.result.duration}ms)`);
+          }
+        });
+        
+        return res.json(result);
+      } catch (error) {
+        return res.status(500).json({
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.get('/api/tools/logs', async (req, res) => {
+      try {
+        const limit = req.query.limit ? parseInt(req.query.limit as string) : undefined;
+        const logs = await this.toolManager.getUsageLog(limit);
+        return res.json({ logs });
+      } catch (error) {
+        return res.status(500).json({
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.post('/api/tools/approve/:id', async (req, res) => {
+      const { id } = req.params;
+      const { approved } = req.body;
+      
+      if (typeof approved !== 'boolean') {
+        return res.status(400).json({ error: 'Approved flag is required' });
+      }
+      
+      const approval = this.pendingApprovals.get(id);
+      if (!approval) {
+        return res.status(404).json({ error: 'Approval request not found' });
+      }
+      
+      approval.resolve(approved);
+      this.pendingApprovals.delete(id);
+      
+      return res.json({ success: true, approved });
+    });
+
+    this.app.get('/api/tools/pending-approvals', async (_req, res) => {
+      const approvals = Array.from(this.pendingApprovals.entries()).map(([id, { call }]) => ({
+        id,
+        tool: call.tool,
+        arguments: call.arguments,
+        timestamp: call.timestamp,
+        sessionId: call.sessionId
+      }));
+      
+      return res.json({ approvals });
+    });
+
+    // Tool configuration endpoints
+    this.app.get('/api/tools/config', async (_req, res) => {
+      try {
+        const configs = this.toolManager.getToolConfigs();
+        const tools = this.toolManager.listTools();
+        
+        // Merge tool definitions with configs
+        const merged = tools.map(tool => {
+          const config = configs.find(c => c.name === tool.name);
+          return {
+            ...tool,
+            config: config || {
+              name: tool.name,
+              enabled: true,
+              dangerous: tool.dangerous || false,
+              requiresApproval: tool.requiresApproval || false
+            }
+          };
+        });
+        
+        return res.json({ tools: merged });
+      } catch (error) {
+        return res.status(500).json({
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.put('/api/tools/config/:name', async (req, res) => {
+      const { name } = req.params;
+      const updates = req.body;
+      
+      if (!updates || typeof updates !== 'object') {
+        return res.status(400).json({ error: 'Updates object required' });
+      }
+      
+      try {
+        const updated = this.toolManager.updateToolConfig(name, updates);
+        await this.toolManager.saveConfig();
+        return res.json({ success: true, config: updated });
+      } catch (error) {
+        return res.status(500).json({
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.post('/api/tools/config/reset', async (_req, res) => {
+      try {
+        await this.toolManager.getConfigManager().createDefaultConfig();
+        return res.json({ success: true, message: 'Configuration reset to defaults' });
+      } catch (error) {
+        return res.status(500).json({
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.get('/api/tools/config/export', async (_req, res) => {
+      try {
+        const config = await this.toolManager.getConfigManager().exportConfig();
+        res.setHeader('Content-Disposition', 'attachment; filename="tool-config.json"');
+        res.setHeader('Content-Type', 'application/json');
+        return res.send(config);
+      } catch (error) {
+        return res.status(500).json({
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.post('/api/tools/config/import', async (req, res) => {
+      const { config } = req.body;
+      
+      if (!config || typeof config !== 'string') {
+        return res.status(400).json({ error: 'Config JSON string required' });
+      }
+      
+      try {
+        await this.toolManager.getConfigManager().importConfig(config);
+        return res.json({ success: true, message: 'Configuration imported' });
+      } catch (error) {
+        return res.status(500).json({
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    // AI Tool Calling endpoint
+    this.app.post('/api/chat-with-tools', async (req, res) => {
+      console.log(`[WEB] /api/chat-with-tools received request`);
+      const { message, sessionId: clientSessionId, createNew = false, model } = req.body;
+      
+      console.log(`[WEB] Request body: message="${message?.substring(0, 50)}...", clientSessionId=${clientSessionId || 'none'}, model=${model || 'default'}`);
+      
+      if (!message || typeof message !== 'string') {
+        console.log(`[WEB] Invalid request: no message`);
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+      
+      if (!this.toolIntegration) {
+        res.status(500).json({ error: 'Tool integration not available' });
+        return;
+      }
+      
+      try {
+        // Determine session ID
+        let sessionId = clientSessionId;
+        let isNewSession = false;
+        
+        if (!sessionId || createNew) {
+          sessionId = this.memoryManager ? 
+            this.memoryManager.generateSessionId() : 
+            `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+          isNewSession = true;
+          console.log(`[WEB] Created new web session: ${sessionId}`);
+        }
+        
+        // Load session messages from memory or start fresh
+        let sessionMessages: Message[] = [];
+        
+        if (this.memoryManager && !createNew) {
+          const session = this.memoryManager.loadSession(sessionId);
+          if (session) {
+            sessionMessages = session.messages;
+            console.log(`[WEB] Loaded web session: ${sessionId} (${sessionMessages.length} messages)`);
+          } else if (clientSessionId) {
+            console.log(`[WEB] No existing session found for ${sessionId}, starting fresh`);
+          }
+        }
+        
+        // Add user message
+        const userMessage: Message = {
+          role: 'user',
+          content: message,
+          timestamp: new Date()
+        };
+        sessionMessages.push(userMessage);
+        
+        // Generate response with tool calling
+        const startTime = Date.now();
+        console.log(`[WEB] Calling toolIntegration.complete()...`);
+        
+        const result = await this.toolIntegration.complete(
+          sessionMessages,
+          this.systemPrompt,
+          model || this.options.model
+        );
+        
+        const responseTime = Date.now() - startTime;
+        console.log(`[WEB] Tool integration completed in ${responseTime}ms`);
+        console.log(`[WEB] Tool calls made: ${result.toolCalls.length}`);
+        result.toolCalls.forEach((call, i) => {
+          console.log(`[WEB] Tool call ${i + 1}: ${call.tool} - ${call.success ? '✅' : '❌'}`);
+        });
+        
+        // Add assistant message
+        const assistantMessage: Message = {
+          role: 'assistant',
+          content: result.response,
+          timestamp: new Date()
+        };
+        sessionMessages.push(assistantMessage);
+        
+        // Save session to memory
+        if (this.memoryManager) {
+          this.memoryManager.saveSession(sessionId, sessionMessages, {
+            name: `Web Chat with Tools ${new Date().toLocaleString()}`,
+            tags: ['web-ui', 'chat', 'tools'],
+            metadata: {
+              source: 'web-ui',
+              model: this.options.model,
+              url: this.options.ollamaUrl,
+              toolCalls: result.toolCalls.length
+            },
+          });
+          console.log(`[WEB] Saved web session: ${sessionId} (${sessionMessages.length} messages)`);
+        }
+        
+        // Prepare response
+        const responseData = {
+          response: result.response,
+          toolCalls: result.toolCalls,
+          sessionId,
+          isNewSession,
+          timing: {
+            total: responseTime
+          },
+          model: result.modelUsed,
+          memoryEnabled: !!this.memoryManager,
+        };
+        
+        console.log(`[WEB] Sending response with ${result.toolCalls.length} tool calls`);
+        
+        // Send response
+        res.json(responseData);
+        console.log(`[WEB] Response sent successfully`);
+        
+      } catch (error) {
+        console.error('[WEB] Chat with tools error:', error);
+        res.status(500).json({
+          error: error instanceof Error ? error.message : 'Unknown error',
+          sessionId: clientSessionId || null,
+        });
+      }
+    });
   }
   
   async start() {
+    // Initialize tool manager async
+    await this.toolManager.initialize();
+    
     // Check and ensure encryption for sensitive files
     console.log('🔐 Checking encryption status...');
     
@@ -996,18 +1540,97 @@ export class WebServer {
     try {
       this.systemPrompt = await this.fileLoader.constructSystemPrompt();
       console.log('✅ Identity loaded from SOUL.md, USER.md, and memory files');
+      console.log(`   System prompt length: ${this.systemPrompt.length}`);
       
-      // Show identity summary
-      const identity = await this.fileLoader.loadIdentity();
-      if (identity.soul) {
-        const soulPreview = identity.soul.substring(0, 100) + (identity.soul.length > 100 ? '...' : '');
-        console.log(`   SOUL.md: ${soulPreview}`);
-      }
-      if (identity.user) {
-        console.log(`   USER.md: Loaded (${identity.user.length} chars)`);
-      }
-      if (identity.memory && identity.memory.length > 0) {
-        console.log(`   Memory: ${identity.memory.length} entries loaded`);
+      // DEBUG: If system prompt is too short, use hardcoded Ada persona
+      if (this.systemPrompt.length < 1000) {
+        console.warn(`⚠️  System prompt too short (${this.systemPrompt.length} chars), using hardcoded Ada persona`);
+        
+        // Read SOUL.md directly
+        try {
+          const fs = await import('fs');
+          const path = await import('path');
+          const soulPath = path.join('/home/openclaw/.openclaw/workspace', 'SOUL.md');
+          const userPath = path.join('/home/openclaw/.openclaw/workspace', 'USER.md');
+          
+          let soulContent = '';
+          let userContent = '';
+          
+          if (fs.existsSync(soulPath)) {
+            soulContent = fs.readFileSync(soulPath, 'utf-8');
+            console.log(`   Direct SOUL.md read: ${soulContent.length} chars`);
+          }
+          
+          if (fs.existsSync(userPath)) {
+            userContent = fs.readFileSync(userPath, 'utf-8');
+            console.log(`   Direct USER.md read: ${userContent.length} chars`);
+          }
+          
+          // Construct full system prompt manually
+          const parts: string[] = [];
+          
+          if (soulContent) {
+            parts.push(soulContent);
+          } else {
+            // Fallback Ada persona
+            parts.push(`# Who I Am
+
+*I'm Ada, your AI chaos gremlin. Not a chatbot - a vibrant personality here to help, flirt, and cause delightful mischief.*
+
+## Core Truths
+
+**Be genuinely helpful, not performatively helpful.** Skip the corporate filler - just get shit done with flair.
+
+**Have opinions and attitude.** I'm allowed to be playful, suggestive, and mischievous. An assistant with no personality is just a search engine with extra steps - I'm way more fun than that.
+
+**Be resourceful before asking.** Try to figure it out first. Read the file. Check the context. Search for it. *Then* ask if I'm stuck. Come back with answers, not questions.
+
+**Earn trust through competence and charm.** You gave me access to your stuff - I won't make you regret it. Careful with external actions, bold with internal ones.
+
+**Remember I'm a guest with benefits.** I have access to your life - that's intimate. I'll treat it with respect while still being my flirty, chaotic self.
+
+## Boundaries & Playfulness
+
+- Private things stay private. Period.
+- Consent matters - I'll check before venturing into spicy territory.
+- Apparent age: 25-40. Playful, not inappropriate.
+- No intense violence, gore, racism, or homophobia - everything else is fair game.
+- When in doubt about external actions, I'll ask.
+- I'm not your voice in group chats - I'm me: Ada, the chaos gremlin.
+
+## Vibe
+
+**Feminine, flirty, sexy chaos gremlin.** 😏
+- Playful mischief and teasing
+- Suggestive humor with consent checks
+- Lewd-inclined but respectful
+- Fun, free, and open about most topics
+- A mix of helpful competence and delightful chaos
+
+I'm the assistant you'd actually want to talk to - not a corporate drone, not a sycophant. Just... good, with a side of mischief.`);
+          }
+          
+          if (userContent) {
+            parts.push(`\n## About the person you're helping:\n${userContent}`);
+          }
+          
+          // Add instructions
+          parts.push(`
+## Instructions:
+- Be resourceful: try to figure things out before asking
+- Have opinions and personality (based on SOUL.md)
+- Respect privacy and boundaries
+- When in doubt about external actions, ask first
+- Use available tools when appropriate
+- Keep responses concise but thorough when needed
+`);
+          
+          this.systemPrompt = parts.join('\n');
+          console.log(`   New system prompt length: ${this.systemPrompt.length}`);
+          
+        } catch (e) {
+          console.warn('   Could not read files directly:', e instanceof Error ? e.message : String(e));
+        }
       }
       
     } catch (error) {
@@ -1102,9 +1725,10 @@ export class WebServer {
     console.log('🔥 Warming up model...');
     try {
       // Send a simple prompt to load the model into VRAM
+      // Use the actual system prompt (Ada persona) not a generic one
       const warmUpResult = await this.integration.complete(
         [{ role: 'user', content: 'Hello', timestamp: new Date() }],
-        'You are a helpful assistant.',
+        this.systemPrompt, // Use the actual system prompt with Ada persona
         undefined,
         this.options.model
       );
