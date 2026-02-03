@@ -25,8 +25,7 @@ config.local.json
 config.user.json
 config.private.json
 
-# Memory and session data
-memory/
+# Memory and session data (user data, not source code)
 *.session.json
 sessions/
 data/
