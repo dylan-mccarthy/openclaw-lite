@@ -30,6 +30,10 @@ const envSchema = z.object({
   
   // Workspace
   OPENCLAW_WORKSPACE: z.string().default('.'),
+  
+  // Security
+  OPENCLAW_ENCRYPTION_KEY: z.string().optional(),
+  SKILL_VERIFY_STRICT: z.coerce.boolean().default(true),
 });
 
 // Parsed environment variables
@@ -107,6 +111,14 @@ export function getWebConfig() {
     port: env.WEB_PORT,
     enableCors: env.WEB_ENABLE_CORS,
     maxContextTokens: env.WEB_MAX_CONTEXT_TOKENS,
+  };
+}
+
+export function getSecurityConfig() {
+  const env = getEnvConfig();
+  return {
+    encryptionKey: env.OPENCLAW_ENCRYPTION_KEY,
+    skillVerifyStrict: env.SKILL_VERIFY_STRICT,
   };
 }
 
