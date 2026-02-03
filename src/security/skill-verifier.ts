@@ -1,6 +1,19 @@
 import { createHash } from 'crypto';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, cpSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
+import { CredentialManager, CredentialDefinition } from './credential-manager.js';
+
+export interface CredentialDefinition {
+  name: string;
+  type: 'api_key' | 'oauth_token' | 'database_url' | 'ssh_key' | 'certificate' | 'password';
+  description: string;
+  required: boolean;
+  scopes?: string[];
+  prompt?: string;
+  helpUrl?: string;
+  validationRegex?: string;
+  encrypted: boolean;
+}
 
 export interface SkillManifest {
   name: string;
@@ -10,6 +23,7 @@ export interface SkillManifest {
   entryPoint: string;
   dependencies?: Record<string, string>;
   permissions?: string[];
+  credentials?: CredentialDefinition[];
   hash: string;
   verified: boolean;
   installedAt: number;
@@ -29,10 +43,12 @@ export class SkillVerifier {
   private skillsPath: string;
   private manifestPath: string;
   private manifests: Map<string, SkillManifest> = new Map();
+  private credentialManager?: CredentialManager;
   
-  constructor(skillsPath: string = 'skills') {
+  constructor(skillsPath: string = 'skills', credentialManager?: CredentialManager) {
     this.skillsPath = skillsPath;
     this.manifestPath = join(skillsPath, '.manifests.json');
+    this.credentialManager = credentialManager;
     this.loadManifests();
   }
   
@@ -51,6 +67,58 @@ export class SkillVerifier {
         console.warn('Failed to load skill manifests:', error);
       }
     }
+  }
+  
+  private parseSkillMetadata(skillPath: string): Partial<SkillManifest> {
+    const metadataFiles = [
+      join(skillPath, 'skill.json'),
+      join(skillPath, 'package.json'),
+      join(skillPath, 'manifest.json')
+    ];
+    
+    for (const filePath of metadataFiles) {
+      if (existsSync(filePath)) {
+        try {
+          const content = readFileSync(filePath, 'utf8');
+          const metadata = JSON.parse(content);
+          
+          const manifest: Partial<SkillManifest> = {
+            name: metadata.name || require('path').basename(skillPath),
+            version: metadata.version || '1.0.0',
+            author: metadata.author,
+            description: metadata.description,
+            entryPoint: metadata.main || metadata.entryPoint || 'index.js',
+            dependencies: metadata.dependencies,
+          };
+          
+          // Parse credential definitions if present
+          if (metadata.credentials && Array.isArray(metadata.credentials)) {
+            manifest.credentials = metadata.credentials.map((cred: any) => ({
+              name: cred.name || '',
+              type: cred.type || 'api_key',
+              description: cred.description || '',
+              required: cred.required !== false,
+              scopes: cred.scopes,
+              prompt: cred.prompt,
+              helpUrl: cred.helpUrl,
+              validationRegex: cred.validationRegex,
+              encrypted: cred.encrypted !== false,
+            }));
+          }
+          
+          return manifest;
+        } catch (error) {
+          console.warn(`Failed to parse metadata file ${filePath}:`, error);
+        }
+      }
+    }
+    
+    // Return basic manifest if no metadata file found
+    return {
+      name: require('path').basename(skillPath),
+      version: '1.0.0',
+      entryPoint: 'index.js',
+    };
   }
   
   private saveManifests(): void {
