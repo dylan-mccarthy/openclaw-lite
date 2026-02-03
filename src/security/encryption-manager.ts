@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync, CipherGCM, DecipherGCM } from 'crypto';
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 
@@ -35,7 +35,7 @@ export class EncryptionManager {
   
   encrypt(text: string): string {
     const iv = randomBytes(this.config.ivLength);
-    const cipher = createCipheriv(this.config.algorithm, this.key, iv) as CipherGCM;
+    const cipher = createCipheriv(this.config.algorithm, this.key, iv) as any;
     
     let encrypted = cipher.update(text, 'utf8', 'hex');
     encrypted += cipher.final('hex');
@@ -58,7 +58,7 @@ export class EncryptionManager {
     const authTag = buffer.slice(this.config.ivLength, this.config.ivLength + 16);
     const encrypted = buffer.slice(this.config.ivLength + 16);
     
-    const decipher = createDecipheriv(this.config.algorithm, this.key, iv) as DecipherGCM;
+    const decipher = createDecipheriv(this.config.algorithm, this.key, iv) as any;
     decipher.setAuthTag(authTag);
     
     let decrypted = decipher.update(encrypted.toString('hex'), 'hex', 'utf8');

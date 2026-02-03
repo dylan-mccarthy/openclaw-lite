@@ -3,6 +3,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
+import readline from 'readline';
 import { ContextManager } from '../context/context-manager.js';
 import { ModelRouter } from '../context/model-router.js';
 import { TokenEstimator } from '../context/token-estimator.js';
@@ -633,9 +634,10 @@ program
   .action(async (options) => {
     const workspace = process.env.OPENCLAW_WORKSPACE || process.cwd();
     const skillsPath = join(workspace, 'skills');
+    const credentialManager = await getCredentialManager();
     
     const { SkillVerifier } = await import('../security/skill-verifier.js');
-    const verifier = new SkillVerifier(skillsPath);
+    const verifier = new SkillVerifier(skillsPath, credentialManager || undefined);
     
     if (options.list) {
       const skills = verifier.listSkills();
@@ -694,6 +696,16 @@ program
             result.warnings.forEach(warning => {
               console.log(chalk.gray(`   • ${warning}`));
             });
+          }
+          
+          const installedSkill = verifier.getSkill(skillName);
+          if (installedSkill?.credentials && installedSkill.credentials.length > 0) {
+            if (!credentialManager) {
+              console.log(chalk.yellow('\n⚠️  Secure storage not configured. Run: claw-lite security --init'));
+              console.log(chalk.gray('   Credential prompts skipped. Skill may not run without credentials.'));
+            } else {
+              await configureSkillCredentials(skillName, installedSkill.credentials, credentialManager);
+            }
           }
         } else {
           console.log(chalk.red(`❌ Skill "${skillName}" failed safety check`));
@@ -839,6 +851,134 @@ program
       process.exit(1);
     }
   });
+
+async function configureSkillCredentials(
+  skillName: string,
+  credentials: any[],
+  credentialManager: any
+): Promise<void> {
+  const needsConfirmation = credentialManager.needsCredentialConfirmation(skillName);
+  if (needsConfirmation) {
+    console.log(chalk.yellow('\n⚠️  Skill credential requirements changed. Re-confirmation required.'));
+  }
+  
+  const requiredCreds = credentials.filter((cred) => cred.required);
+  if (requiredCreds.length > 0) {
+    const proceed = await promptYesNo('Configure required credentials now?', true);
+    if (!proceed) {
+      console.log(chalk.yellow('⚠️  Required credentials not configured. Skill may not run.'));
+      return;
+    }
+  }
+  
+  for (const cred of credentials) {
+    const alreadyInstalled = credentialManager.hasCredential(skillName, cred.name);
+    const isOptional = !cred.required;
+    
+    if (alreadyInstalled && !needsConfirmation) {
+      continue;
+    }
+    
+    if (isOptional) {
+      const shouldConfigure = await promptYesNo(`Configure optional credential "${cred.name}"?`, false);
+      if (!shouldConfigure) {
+        continue;
+      }
+    }
+    
+    const authFlow = cred.authFlow || (cred.type === 'oauth_token' ? 'oauth' : 'manual');
+    if (authFlow === 'oauth') {
+      const authUrl = cred.oauth?.authUrl || cred.helpUrl;
+      if (!authUrl) {
+        console.log(chalk.yellow(`⚠️  OAuth credential "${cred.name}" requires an auth URL. Skipping.`));
+        continue;
+      }
+      const request = await credentialManager.createOAuthRequest(
+        skillName,
+        cred.name,
+        authUrl,
+        cred.oauth?.provider,
+        cred.oauth?.scopes || cred.scopes
+      );
+      console.log(chalk.cyan(`
+🔐 OAuth required for ${cred.name}`));
+      console.log(chalk.gray(`   Open Admin UI to complete OAuth flow:`));
+      console.log(chalk.gray(`   ${authUrl}`));
+      console.log(chalk.gray(`   Request ID: ${request.requestId}`));
+      continue;
+    }
+    
+    const prompt = cred.prompt || `Enter ${cred.description || cred.name}: `;
+    const value = await promptSecret(prompt);
+    if (!value) {
+      console.log(chalk.yellow(`⚠️  No value provided for ${cred.name}, skipping.`));
+      continue;
+    }
+    await credentialManager.installCredential(skillName, cred.name, value);
+    console.log(chalk.green(`✅ Stored credential ${cred.name}`));
+  }
+  
+  if (needsConfirmation) {
+    credentialManager.confirmSkillCredentials(skillName);
+  }
+}
+
+// CLI prompt helpers
+function promptText(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+function promptYesNo(question: string, defaultYes: boolean = true): Promise<boolean> {
+  const suffix = defaultYes ? ' (Y/n) ' : ' (y/N) ';
+  return promptText(question + suffix).then((answer) => {
+    if (!answer) return defaultYes;
+    return ['y', 'yes'].includes(answer.toLowerCase());
+  });
+}
+
+function promptSecret(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const stdin = process.stdin;
+    const onData = (char: Buffer) => {
+      const charStr = char.toString('utf8');
+      if (charStr === '\n' || charStr === '\r' || charStr === '\u0004') {
+        stdin.removeListener('data', onData);
+        (rl as any).output.write('\n');
+        rl.close();
+        resolve(buffer.join(''));
+      } else if (charStr === '\u0003') {
+        process.exit(1);
+      } else {
+        buffer.push(charStr);
+        (rl as any).output.write('*');
+      }
+    };
+    const buffer: string[] = [];
+    (rl as any).output.write(question);
+    stdin.on('data', onData);
+  });
+}
+
+async function getCredentialManager(): Promise<any | null> {
+  try {
+    const { SecureKeyManager } = await import('../security/secure-key-manager.js');
+    const { CredentialManager } = await import('../security/credential-manager.js');
+    const keyManager = new SecureKeyManager();
+    if (!keyManager.isSecureStorageAvailable()) {
+      return null;
+    }
+    return new CredentialManager();
+  } catch {
+    return null;
+  }
+}
 
 // Helper function to create sample conversation
 function createSampleConversation(count: number = 10): Message[] {

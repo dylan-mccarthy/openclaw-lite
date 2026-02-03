@@ -1,6 +1,6 @@
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync, createHash } from 'crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { join, dirname } from 'path';
+import { join } from 'path';
 
 export interface CredentialDefinition {
   name: string;
@@ -12,6 +12,13 @@ export interface CredentialDefinition {
   helpUrl?: string;
   validationRegex?: string;
   encrypted: boolean;
+  authFlow?: 'manual' | 'oauth';
+  oauth?: {
+    provider?: string;
+    authUrl?: string;
+    tokenUrl?: string;
+    scopes?: string[];
+  };
 }
 
 export interface SkillCredentialManifest {
@@ -19,7 +26,11 @@ export interface SkillCredentialManifest {
   skillName: string;
   version: string;
   credentials: CredentialDefinition[];
+  schemaHash: string;
+  skillHash?: string;
   installedAt: number;
+  confirmedAt?: number;
+  needsConfirmation?: boolean;
   lastAccessed?: number;
 }
 
@@ -44,9 +55,21 @@ export interface CredentialRequest {
   };
 }
 
+export interface OAuthRequest {
+  requestId: string;
+  skillId: string;
+  credentialName: string;
+  provider?: string;
+  authUrl: string;
+  scopes?: string[];
+  createdAt: number;
+  status: 'pending' | 'completed';
+}
+
 export class CredentialManager {
   private vaultPath: string;
   private manifestsPath: string;
+  private oauthRequestsPath: string;
   private masterKey: Buffer;
   
   constructor(
@@ -55,6 +78,7 @@ export class CredentialManager {
   ) {
     this.vaultPath = join(secureStoragePath, 'credentials');
     this.manifestsPath = join(secureStoragePath, 'credential-manifests');
+    this.oauthRequestsPath = join(secureStoragePath, 'oauth-requests');
     
     // Derive or use provided master key
     if (masterKey) {
@@ -71,11 +95,57 @@ export class CredentialManager {
     }
     
     // Ensure directories exist
-    [this.vaultPath, this.manifestsPath].forEach(path => {
+    [this.vaultPath, this.manifestsPath, this.oauthRequestsPath].forEach(path => {
       if (!existsSync(path)) {
         mkdirSync(path, { recursive: true });
       }
     });
+  }
+  
+  private calculateSchemaHash(credentials: CredentialDefinition[]): string {
+    const normalized = credentials
+      .map((cred) => ({
+        name: cred.name,
+        type: cred.type,
+        required: cred.required,
+        scopes: cred.scopes || [],
+        helpUrl: cred.helpUrl || '',
+        validationRegex: cred.validationRegex || '',
+        encrypted: cred.encrypted,
+        authFlow: cred.authFlow || 'manual',
+        oauth: cred.oauth
+          ? {
+              provider: cred.oauth.provider || '',
+              authUrl: cred.oauth.authUrl || '',
+              tokenUrl: cred.oauth.tokenUrl || '',
+              scopes: cred.oauth.scopes || []
+            }
+          : undefined
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    
+    return createHash('sha256')
+      .update(JSON.stringify(normalized))
+      .digest('hex');
+  }
+  
+  private isDevCredentialFallbackEnabled(): boolean {
+    return process.env.NODE_ENV === 'development' || process.env.OPENCLAW_DEV_CREDENTIALS === '1';
+  }
+  
+  private getEnvFallbackCredential(skillId: string, credentialName: string): string | null {
+    if (!this.isDevCredentialFallbackEnabled()) {
+      return null;
+    }
+    
+    const normalize = (value: string) => value
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, '_');
+    
+    const skillScopedKey = `${normalize(skillId)}_${normalize(credentialName)}`;
+    const simpleKey = normalize(credentialName);
+    
+    return process.env[skillScopedKey] || process.env[simpleKey] || null;
   }
   
   private encryptCredential(value: string): { encrypted: string; iv: string; authTag: string } {
@@ -103,14 +173,23 @@ export class CredentialManager {
     skillId: string,
     skillName: string,
     version: string,
-    credentials: CredentialDefinition[]
+    credentials: CredentialDefinition[],
+    skillHash?: string
   ): Promise<SkillCredentialManifest> {
+    const schemaHash = this.calculateSchemaHash(credentials);
+    const existing = this.getSkillCredentialManifest(skillId);
+    const needsConfirmation = existing ? existing.schemaHash !== schemaHash : false;
+    
     const manifest: SkillCredentialManifest = {
       skillId,
       skillName,
       version,
       credentials,
-      installedAt: Date.now()
+      schemaHash,
+      skillHash,
+      installedAt: Date.now(),
+      confirmedAt: needsConfirmation ? undefined : existing?.confirmedAt,
+      needsConfirmation
     };
     
     const manifestPath = join(this.manifestsPath, `${skillId}.json`);
@@ -161,6 +240,79 @@ export class CredentialManager {
     return true;
   }
   
+  async createOAuthRequest(
+    skillId: string,
+    credentialName: string,
+    authUrl: string,
+    provider?: string,
+    scopes?: string[]
+  ): Promise<OAuthRequest> {
+    const requestId = randomBytes(16).toString('hex');
+    const request: OAuthRequest = {
+      requestId,
+      skillId,
+      credentialName,
+      provider,
+      authUrl,
+      scopes,
+      createdAt: Date.now(),
+      status: 'pending'
+    };
+    
+    const requestPath = join(this.oauthRequestsPath, `${requestId}.json`);
+    writeFileSync(requestPath, JSON.stringify(request, null, 2), 'utf8');
+    
+    return request;
+  }
+  
+  getOAuthRequest(requestId: string): OAuthRequest | null {
+    const requestPath = join(this.oauthRequestsPath, `${requestId}.json`);
+    if (!existsSync(requestPath)) {
+      return null;
+    }
+    try {
+      return JSON.parse(readFileSync(requestPath, 'utf8')) as OAuthRequest;
+    } catch {
+      return null;
+    }
+  }
+  
+  listOAuthRequests(skillId?: string): OAuthRequest[] {
+    if (!existsSync(this.oauthRequestsPath)) {
+      return [];
+    }
+    const fs = require('fs');
+    const files = fs.readdirSync(this.oauthRequestsPath)
+      .filter((file: string) => file.endsWith('.json'));
+    
+    return files.map((file: string) => {
+      const requestPath = join(this.oauthRequestsPath, file);
+      return JSON.parse(readFileSync(requestPath, 'utf8')) as OAuthRequest;
+    }).filter((request: OAuthRequest) => !skillId || request.skillId === skillId);
+  }
+  
+  async completeOAuthRequest(requestId: string, token: string): Promise<boolean> {
+    const request = this.getOAuthRequest(requestId);
+    if (!request) {
+      return false;
+    }
+    
+    const success = await this.installCredential(
+      request.skillId,
+      request.credentialName,
+      token
+    );
+    
+    if (success) {
+      request.status = 'completed';
+      const requestPath = join(this.oauthRequestsPath, `${requestId}.json`);
+      writeFileSync(requestPath, JSON.stringify(request, null, 2), 'utf8');
+      return true;
+    }
+    
+    return false;
+  }
+  
   async getCredential(request: CredentialRequest): Promise<string | null> {
     const { skillId, credentialName } = request;
     
@@ -178,9 +330,19 @@ export class CredentialManager {
       return null;
     }
     
+    if (manifest.needsConfirmation) {
+      console.warn(`Credential access blocked: ${skillId} credentials require confirmation after manifest change`);
+      return null;
+    }
+    
     // Load stored credential
     const credentialPath = join(this.vaultPath, `${skillId}.${credentialName}.json`);
     if (!existsSync(credentialPath)) {
+      const envValue = this.getEnvFallbackCredential(skillId, credentialName);
+      if (envValue) {
+        console.warn(`⚠️  Using dev env credential for ${skillId}.${credentialName}. Set OPENCLAW_DEV_CREDENTIALS=1 and NODE_ENV=development only.`);
+        return envValue;
+      }
       console.warn(`Credential ${credentialName} not installed for skill ${skillId}`);
       return null;
     }
@@ -210,7 +372,7 @@ export class CredentialManager {
     }
   }
   
-  async hasCredential(skillId: string, credentialName: string): Promise<boolean> {
+  hasCredential(skillId: string, credentialName: string): boolean {
     const credentialPath = join(this.vaultPath, `${skillId}.${credentialName}.json`);
     return existsSync(credentialPath);
   }
@@ -228,7 +390,7 @@ export class CredentialManager {
     
     // Check which credentials are installed
     for (const cred of manifest.credentials) {
-      if (await this.hasCredential(skillId, cred.name)) {
+      if (this.hasCredential(skillId, cred.name)) {
         installed.push(cred.name);
       }
     }
@@ -295,6 +457,25 @@ export class CredentialManager {
     return null;
   }
   
+  needsCredentialConfirmation(skillId: string): boolean {
+    const manifest = this.getSkillCredentialManifest(skillId);
+    return !!manifest?.needsConfirmation;
+  }
+  
+  confirmSkillCredentials(skillId: string): boolean {
+    const manifest = this.getSkillCredentialManifest(skillId);
+    if (!manifest) {
+      return false;
+    }
+    
+    manifest.needsConfirmation = false;
+    manifest.confirmedAt = Date.now();
+    
+    const manifestPath = join(this.manifestsPath, `${skillId}.json`);
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+    return true;
+  }
+  
   getAllSkillManifests(): SkillCredentialManifest[] {
     if (!existsSync(this.manifestsPath)) {
       return [];
@@ -349,12 +530,12 @@ export class CredentialManager {
     writeFileSync(logPath, logLine, { flag: 'a' });
   }
   
-  async validateSkillCredentials(skillId: string): Promise<{
+  validateSkillCredentials(skillId: string): {
     valid: boolean;
     missing: string[];
     installed: string[];
     warnings: string[];
-  }> {
+  } {
     const manifest = this.getSkillCredentialManifest(skillId);
     if (!manifest) {
       return {
@@ -370,15 +551,23 @@ export class CredentialManager {
     const warnings: string[] = [];
     
     for (const cred of manifest.credentials) {
-      if (await this.hasCredential(skillId, cred.name)) {
+      const envFallback = this.getEnvFallbackCredential(skillId, cred.name);
+      if (this.hasCredential(skillId, cred.name) || envFallback) {
         installed.push(cred.name);
+        if (envFallback) {
+          warnings.push(`Using dev env fallback for ${cred.name}`);
+        }
       } else if (cred.required) {
         missing.push(cred.name);
       }
     }
     
+    if (manifest.needsConfirmation) {
+      warnings.push('Credentials require confirmation after manifest change');
+    }
+    
     return {
-      valid: missing.length === 0,
+      valid: missing.length === 0 && !manifest.needsConfirmation,
       missing,
       installed,
       warnings

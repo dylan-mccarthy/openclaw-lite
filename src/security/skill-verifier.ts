@@ -3,18 +3,6 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, cpSync, rmSync } fr
 import { join, dirname } from 'path';
 import { CredentialManager, CredentialDefinition } from './credential-manager.js';
 
-export interface CredentialDefinition {
-  name: string;
-  type: 'api_key' | 'oauth_token' | 'database_url' | 'ssh_key' | 'certificate' | 'password';
-  description: string;
-  required: boolean;
-  scopes?: string[];
-  prompt?: string;
-  helpUrl?: string;
-  validationRegex?: string;
-  encrypted: boolean;
-}
-
 export interface SkillManifest {
   name: string;
   version: string;
@@ -103,6 +91,8 @@ export class SkillVerifier {
               helpUrl: cred.helpUrl,
               validationRegex: cred.validationRegex,
               encrypted: cred.encrypted !== false,
+              authFlow: cred.authFlow || (cred.type === 'oauth_token' ? 'oauth' : 'manual'),
+              oauth: cred.oauth,
             }));
           }
           
@@ -231,7 +221,9 @@ export class SkillVerifier {
   }
   
   scanSkillDirectory(skillPath: string): SkillScanResult {
+    // @ts-ignore
     const fs = require('fs');
+    // @ts-ignore
     const path = require('path');
     
     const issues: string[] = [];
@@ -338,22 +330,41 @@ export class SkillVerifier {
     // Copy files to target
     cpSync(sourcePath, targetPath, { recursive: true });
     
+    const metadata = this.parseSkillMetadata(sourcePath);
+    
     // Create manifest
     const manifest: SkillManifest = {
-      name: skillName,
-      version: '1.0.0', // Would parse from package.json or similar
-      entryPoint: 'index.js', // Would detect from package.json
+      name: metadata.name || skillName,
+      version: metadata.version || '1.0.0',
+      author: metadata.author,
+      description: metadata.description,
+      entryPoint: metadata.entryPoint || 'index.js',
+      dependencies: metadata.dependencies,
+      permissions: metadata.permissions || [],
+      credentials: metadata.credentials || [],
       hash: scanResult.hash,
       verified: true,
       installedAt: Date.now(),
       source: sourceUrl,
       sourceHash: sourceUrl ? this.calculateHash(sourceUrl) : undefined,
-      permissions: [], // Would parse from skill metadata
     };
     
     // Save manifest
     this.manifests.set(skillName, manifest);
     this.saveManifests();
+    
+    // Register credentials (if available)
+    if (this.credentialManager && manifest.credentials && manifest.credentials.length > 0) {
+      this.credentialManager.registerSkillCredentials(
+        skillName,
+        manifest.name,
+        manifest.version,
+        manifest.credentials,
+        scanResult.hash
+      ).catch(err => {
+        console.warn(`Failed to register credentials for ${skillName}:`, err);
+      });
+    }
     
     return scanResult;
   }
