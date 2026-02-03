@@ -1,5 +1,7 @@
 import fs from 'fs';
 import path from 'path';
+import { FileSecurityManager } from '../security/encryption-manager.js';
+import { getSecurityConfig } from '../config/env.js';
 
 export interface Identity {
   soul?: string;
@@ -11,9 +13,15 @@ export interface Identity {
 
 export class FileLoader {
   private workspacePath: string;
+  private securityManager: FileSecurityManager | null = null;
   
   constructor(workspacePath: string = process.cwd()) {
     this.workspacePath = workspacePath;
+    
+    const security = getSecurityConfig();
+    if (security.encryptionKey) {
+      this.securityManager = new FileSecurityManager(this.workspacePath, security.encryptionKey);
+    }
   }
   
   async loadIdentity(): Promise<Identity> {
@@ -91,6 +99,9 @@ export class FileLoader {
     
     if (fs.existsSync(filePath)) {
       try {
+        if (this.securityManager) {
+          return this.securityManager.readSecureFile(filename);
+        }
         return fs.readFileSync(filePath, 'utf-8');
       } catch (error) {
         console.warn(`Failed to read ${filename}:`, error instanceof Error ? error.message : String(error));
@@ -113,7 +124,9 @@ export class FileLoader {
       // Read MEMORY.md first (long-term curated memory)
       const memoryFile = path.join(this.workspacePath, 'MEMORY.md');
       if (fs.existsSync(memoryFile)) {
-        const content = fs.readFileSync(memoryFile, 'utf-8');
+        const content = this.securityManager
+          ? this.securityManager.readSecureFile('MEMORY.md')
+          : fs.readFileSync(memoryFile, 'utf-8');
         // Take first 1000 chars as summary
         memories.push(content.substring(0, 1000) + (content.length > 1000 ? '...' : ''));
       }
@@ -127,7 +140,10 @@ export class FileLoader {
       
       for (const file of files) {
         const filePath = path.join(memoryDir, file);
-        const content = fs.readFileSync(filePath, 'utf-8');
+        const relative = path.relative(this.workspacePath, filePath).replace(/\\/g, '/');
+        const content = this.securityManager
+          ? this.securityManager.readSecureFile(relative)
+          : fs.readFileSync(filePath, 'utf-8');
         const date = file.replace('.md', '');
         // Take first 500 chars per file
         const preview = content.substring(0, 500) + (content.length > 500 ? '...' : '');
@@ -162,14 +178,20 @@ export class FileLoader {
       // Load today's memory
       const todayFile = path.join(memoryDir, `${todayStr}.md`);
       if (fs.existsSync(todayFile)) {
-        const content = fs.readFileSync(todayFile, 'utf-8');
+        const relative = path.relative(this.workspacePath, todayFile).replace(/\\/g, '/');
+        const content = this.securityManager
+          ? this.securityManager.readSecureFile(relative)
+          : fs.readFileSync(todayFile, 'utf-8');
         recent.push(`[Today ${todayStr}] ${content.substring(0, 800)}${content.length > 800 ? '...' : ''}`);
       }
       
       // Load yesterday's memory
       const yesterdayFile = path.join(memoryDir, `${yesterdayStr}.md`);
       if (fs.existsSync(yesterdayFile)) {
-        const content = fs.readFileSync(yesterdayFile, 'utf-8');
+        const relative = path.relative(this.workspacePath, yesterdayFile).replace(/\\/g, '/');
+        const content = this.securityManager
+          ? this.securityManager.readSecureFile(relative)
+          : fs.readFileSync(yesterdayFile, 'utf-8');
         recent.push(`[Yesterday ${yesterdayStr}] ${content.substring(0, 800)}${content.length > 800 ? '...' : ''}`);
       }
       
@@ -195,7 +217,13 @@ export class FileLoader {
       const timestamp = new Date().toISOString();
       const memoryEntry = `\n\n---\n[${timestamp}] ${entry}`;
       
-      fs.appendFileSync(todayFile, memoryEntry, 'utf-8');
+      if (this.securityManager) {
+        const relative = path.relative(this.workspacePath, todayFile).replace(/\\/g, '/');
+        const existing = fs.existsSync(todayFile) ? this.securityManager.readSecureFile(relative) : '';
+        this.securityManager.writeSecureFile(relative, existing + memoryEntry);
+      } else {
+        fs.appendFileSync(todayFile, memoryEntry, 'utf-8');
+      }
       
     } catch (error) {
       console.error('Failed to update memory:', error instanceof Error ? error.message : String(error));
@@ -215,7 +243,13 @@ export class FileLoader {
       const timestamp = new Date().toISOString();
       const memoryEntry = `\n\n## ${timestamp}\n${entry}`;
       
-      fs.appendFileSync(memoryFile, memoryEntry, 'utf-8');
+      if (this.securityManager) {
+        const relative = path.relative(this.workspacePath, memoryFile).replace(/\\/g, '/');
+        const existing = fs.existsSync(memoryFile) ? this.securityManager.readSecureFile(relative) : '# MEMORY.md - Long-Term Memory\n\n';
+        this.securityManager.writeSecureFile(relative, existing + memoryEntry);
+      } else {
+        fs.appendFileSync(memoryFile, memoryEntry, 'utf-8');
+      }
       
     } catch (error) {
       console.error('Failed to update long-term memory:', error instanceof Error ? error.message : String(error));

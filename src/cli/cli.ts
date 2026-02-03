@@ -8,6 +8,8 @@ import { ModelRouter } from '../context/model-router.js';
 import { TokenEstimator } from '../context/token-estimator.js';
 import { OllamaIntegration } from '../ollama/integration.js';
 import { getConfigManager } from '../config/config.js';
+import { FileSecurityManager } from '../security/encryption-manager.js';
+import { getSecurityConfig } from '../config/env.js';
 import type { Message } from '../context/types.js';
 
 const program = new Command();
@@ -369,6 +371,51 @@ program
     } catch (error) {
       console.error(chalk.red('Failed to start web server:'), error instanceof Error ? error.message : String(error));
       process.exit(1);
+    }
+  });
+
+// Security command
+program
+  .command('security')
+  .description('Manage encryption for sensitive files')
+  .option('-e, --encrypt', 'Encrypt sensitive files in workspace')
+  .option('-d, --decrypt', 'Decrypt sensitive files in workspace (to stdout)')
+  .option('-s, --status', 'Show encryption status of sensitive files')
+  .action(async (options) => {
+    const security = getSecurityConfig();
+    const workspace = process.env.OPENCLAW_WORKSPACE || process.cwd();
+    
+    if (!security.encryptionKey) {
+      console.log(chalk.yellow('⚠️  OPENCLAW_ENCRYPTION_KEY is not set.'));
+      console.log(chalk.gray('   Set it in your .env file to enable encryption.'));
+      return;
+    }
+    
+    const manager = new FileSecurityManager(workspace, security.encryptionKey);
+    
+    if (options.encrypt) {
+      console.log(chalk.gray('🔐 Encrypting sensitive files...'));
+      manager.ensureAllEncrypted();
+      console.log(chalk.green('✅ Encryption complete'));
+      return;
+    }
+    
+    if (options.decrypt) {
+      console.log(chalk.yellow('⚠️  Decryption outputs to stdout only (no files written).'));
+      console.log(chalk.gray('   This is a safety feature. Use read operations for access.'));
+      return;
+    }
+    
+    if (options.status || (!options.encrypt && !options.decrypt)) {
+      console.log(chalk.bold('🔐 Encryption Status'));
+      console.log(chalk.gray('─'.repeat(60)));
+      console.log(`Workspace: ${chalk.cyan(workspace)}`);
+      console.log(`Encryption: ${chalk.green('ENABLED')}`);
+      console.log(`Key source: ${chalk.yellow('OPENCLAW_ENCRYPTION_KEY')}`);
+      console.log(chalk.gray('\nSensitive files will be encrypted at rest:'));
+      console.log(chalk.gray('  SOUL.md, USER.md, IDENTITY.md, MEMORY.md')); 
+      console.log(chalk.gray('  memory/*.md, AGENTS.md, TOOLS.md, HEARTBEAT.md')); 
+      return;
     }
   });
 
