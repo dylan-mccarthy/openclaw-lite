@@ -229,6 +229,52 @@ export class WebServer {
                 .error {
                   color: #ef4444;
                 }
+                .thinking-container {
+                  background: #1e293b;
+                  border: 1px solid #475569;
+                  border-radius: 8px;
+                  margin-bottom: 10px;
+                  padding: 10px;
+                  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+                  font-size: 13px;
+                }
+                .thinking-header {
+                  display: flex;
+                  justify-content: space-between;
+                  align-items: center;
+                  margin-bottom: 8px;
+                  padding-bottom: 8px;
+                  border-bottom: 1px solid #334155;
+                }
+                .thinking-toggle {
+                  color: #60a5fa;
+                  cursor: pointer;
+                  font-weight: 500;
+                }
+                .thinking-toggle:hover {
+                  color: #3b82f6;
+                }
+                .thinking-hide {
+                  background: #475569;
+                  color: #94a3b8;
+                  border: none;
+                  border-radius: 4px;
+                  padding: 4px 8px;
+                  font-size: 12px;
+                  cursor: pointer;
+                }
+                .thinking-hide:hover {
+                  background: #64748b;
+                }
+                .thinking-content {
+                  white-space: pre-wrap;
+                  color: #94a3b8;
+                  max-height: 200px;
+                  overflow-y: auto;
+                  padding: 8px;
+                  background: #0f172a;
+                  border-radius: 4px;
+                }
               </style>
             </head>
             <body>
@@ -295,15 +341,57 @@ export class WebServer {
                     
                     const data = await response.json();
                     
-                    // Replace thinking with actual response
-                    thinking.innerHTML = \`
-                      <div>\${data.response}</div>
-                      <div class="stats">
-                        ⏱️ \${data.timing?.total || 0}ms | 
-                        📊 \${data.tokens?.input || 0}+\${data.tokens?.output || 0} tokens |
-                        🧠 \${data.context?.compressedMessages || 0}/\${data.context?.originalMessages || 0} msgs
-                      </div>
-                    \`;
+                    // Parse thinking tags if present
+                    let displayResponse = data.response;
+                    let thinkingContent = '';
+                    
+                    const thinkMatch = data.response.match(/<think>([\\s\\S]*?)<\\/think>/);
+                    if (thinkMatch) {
+                      thinkingContent = thinkMatch[1].trim();
+                      displayResponse = data.response.replace(/<think>[\\s\\S]*?<\\/think>\\s*/g, '').trim();
+                      
+                      // Update thinking placeholder with actual thinking
+                      thinking.innerHTML = \`
+                        <div class="thinking-container">
+                          <div class="thinking-header">
+                            <span class="thinking-toggle">🤔 Thinking</span>
+                            <button class="thinking-hide">Hide</button>
+                          </div>
+                          <div class="thinking-content">\${thinkingContent}</div>
+                        </div>
+                        <div class="assistant-message message">
+                          <div>\${displayResponse}</div>
+                          <div class="stats">
+                            ⏱️ \${data.timing?.total || 0}ms | 
+                            📊 \${data.tokens?.input || 0}+\${data.tokens?.output || 0} tokens |
+                            🧠 \${data.context?.compressedMessages || 0}/\${data.context?.originalMessages || 0} msgs
+                          </div>
+                        </div>
+                      \`;
+                      
+                      // Add toggle functionality
+                      const thinkingToggle = thinking.querySelector('.thinking-toggle');
+                      const thinkingHide = thinking.querySelector('.thinking-hide');
+                      const thinkingContentEl = thinking.querySelector('.thinking-content');
+                      
+                      thinkingToggle.onclick = () => {
+                        thinkingContentEl.style.display = thinkingContentEl.style.display === 'none' ? 'block' : 'none';
+                      };
+                      
+                      thinkingHide.onclick = () => {
+                        thinking.querySelector('.thinking-container').style.display = 'none';
+                      };
+                    } else {
+                      // No thinking tags, just show response
+                      thinking.innerHTML = \`
+                        <div>\${displayResponse}</div>
+                        <div class="stats">
+                          ⏱️ \${data.timing?.total || 0}ms | 
+                          📊 \${data.tokens?.input || 0}+\${data.tokens?.output || 0} tokens |
+                          🧠 \${data.context?.compressedMessages || 0}/\${data.context?.originalMessages || 0} msgs
+                        </div>
+                      \`;
+                    }
                     
                   } catch (error) {
                     thinking.innerHTML = \`❌ Error: \${error.message}\`;
@@ -484,12 +572,149 @@ export class WebServer {
       }
     });
     
-    // Chat endpoint with memory integration
-    this.app.post('/api/chat', async (req, res) => {
-      const { message, sessionId: clientSessionId, createNew = false } = req.body;
+    // Streaming chat endpoint (disabled for now)
+    /*
+    this.app.post('/api/chat/stream', async (req, res) => {
+      const { message, sessionId: clientSessionId, createNew = false, model } = req.body;
       
       if (!message || typeof message !== 'string') {
-        return res.status(400).json({ error: 'Message is required' });
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+      
+      // Set SSE headers
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      
+      try {
+        // Determine session ID
+        let sessionId = clientSessionId;
+        let isNewSession = false;
+        
+        if (!sessionId || createNew) {
+          sessionId = this.memoryManager ? 
+            this.memoryManager.generateSessionId() : 
+            `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+          isNewSession = true;
+          console.log(`💾 Created new web session: ${sessionId}`);
+        }
+        
+        // Load session messages from memory or start fresh
+        let sessionMessages: Message[] = [];
+        
+        if (this.memoryManager && !createNew) {
+          const session = this.memoryManager.loadSession(sessionId);
+          if (session) {
+            sessionMessages = session.messages;
+            console.log(`💾 Loaded web session: ${sessionId} (${sessionMessages.length} messages)`);
+          } else if (clientSessionId) {
+            console.log(`💾 No existing session found for ${sessionId}, starting fresh`);
+          }
+        }
+        
+        // Add user message
+        const userMessage: Message = {
+          role: 'user',
+          content: message,
+          timestamp: new Date()
+        };
+        sessionMessages.push(userMessage);
+        
+        // Send initial metadata
+        res.write(`data: ${JSON.stringify({
+          type: 'metadata',
+          sessionId,
+          isNewSession,
+          model: model || this.options.model
+        })}\n\n`);
+        
+        // Collect full response for memory
+        let fullResponse = '';
+        let thinkingContent = '';
+        
+        // Stream the response
+        const stream = this.integration.streamComplete(
+          sessionMessages,
+          this.systemPrompt,
+          undefined,
+          model || this.options.model
+        );
+        
+        for await (const { chunk, isThinking, done } of stream) {
+          if (chunk) {
+            if (isThinking) {
+              thinkingContent += chunk;
+              res.write(`data: ${JSON.stringify({
+                type: 'thinking',
+                chunk,
+                done: false
+              })}\n\n`);
+            } else {
+              fullResponse += chunk;
+              res.write(`data: ${JSON.stringify({
+                type: 'response',
+                chunk,
+                done: false
+              })}\n\n`);
+            }
+          }
+          
+          if (done) {
+            // Add assistant message to memory
+            const assistantMessage: Message = {
+              role: 'assistant',
+              content: fullResponse,
+              timestamp: new Date()
+            };
+            sessionMessages.push(assistantMessage);
+            
+            // Save session to memory
+            if (this.memoryManager) {
+              this.memoryManager.saveSession(sessionId, sessionMessages, {
+                createdAt: Date.now(),
+                lastAccessed: Date.now()
+              });
+              console.log(`💾 Saved web session: ${sessionId} (${sessionMessages.length} messages)`);
+            }
+            
+            // Send final done event
+            res.write(`data: ${JSON.stringify({
+              type: 'done',
+              thinking: thinkingContent,
+              response: fullResponse,
+              sessionId,
+              model: model || this.options.model
+            })}\n\n`);
+            
+            res.end();
+            break;
+          }
+        }
+      } catch (error) {
+        console.error('Streaming error:', error);
+        res.write(`data: ${JSON.stringify({
+          type: 'error',
+          error: error instanceof Error ? error.message : String(error)
+        })}\n\n`);
+        res.end();
+      }
+    });
+    */
+    
+    // Chat endpoint with memory integration (regular)
+    this.app.post('/api/chat', async (req, res) => {
+      console.log(`[WEB] /api/chat received request`);
+      const { message, sessionId: clientSessionId, createNew = false, model } = req.body;
+      
+      console.log(`[WEB] Request body: message="${message?.substring(0, 50)}...", clientSessionId=${clientSessionId || 'none'}, model=${model || 'default'}`);
+      
+      if (!message || typeof message !== 'string') {
+        console.log(`[WEB] Invalid request: no message`);
+        res.status(400).json({ error: 'Message is required' });
+        return;
       }
       
       try {
@@ -531,14 +756,19 @@ export class WebServer {
         // Generate response
         const startTime = Date.now();
         
+        console.log(`[WEB] Calling integration.complete()...`);
         const result = await this.integration.complete(
           sessionMessages,
           this.systemPrompt,
           undefined, // taskRequirements
-          this.options.model // forceModel
+          model || this.options.model // forceModel
         );
         
         const responseTime = Date.now() - startTime;
+        console.log(`[WEB] Integration completed in ${responseTime}ms`);
+        console.log(`[WEB] Result model: ${result.modelUsed}`);
+        console.log(`[WEB] Result response length: ${result.response.length}`);
+        console.log(`[WEB] Result has thinking tags: ${result.response.includes('<think>')}`);
         
         // Add assistant message
         const assistantMessage: Message = {
@@ -563,8 +793,8 @@ export class WebServer {
           console.log(`💾 Saved web session: ${sessionId} (${sessionMessages.length} messages)`);
         }
         
-        // Return response
-        return res.json({
+        // Prepare response
+        const responseData = {
           response: result.response,
           sessionId,
           isNewSession,
@@ -577,7 +807,13 @@ export class WebServer {
           context: result.context,
           model: result.modelUsed,
           memoryEnabled: !!this.memoryManager
-        });
+        };
+        
+        console.log(`[WEB] Sending response, total size: ${JSON.stringify(responseData).length} bytes`);
+        console.log(`[WEB] Response preview: ${result.response.substring(0, 100).replace(/\n/g, '\\n')}...`);
+        
+        // Send response
+        return res.json(responseData);
         
       } catch (error) {
         console.error('Chat error:', error);
@@ -845,6 +1081,11 @@ export class WebServer {
         console.log('\n💡 Press Ctrl+C to stop');
         console.log('─'.repeat(40));
         
+        // Warm up the model
+        this.warmUpModel().catch(error => {
+          console.warn('Model warm-up failed:', error.message);
+        });
+        
         resolve();
       });
     });
@@ -854,6 +1095,22 @@ export class WebServer {
     // Cleanup if needed
     if (this.memoryManager) {
       // Any memory cleanup if needed
+    }
+  }
+  
+  private async warmUpModel(): Promise<void> {
+    console.log('🔥 Warming up model...');
+    try {
+      // Send a simple prompt to load the model into VRAM
+      const warmUpResult = await this.integration.complete(
+        [{ role: 'user', content: 'Hello', timestamp: new Date() }],
+        'You are a helpful assistant.',
+        undefined,
+        this.options.model
+      );
+      console.log(`✅ Model warmed up (${warmUpResult.timing?.total || 0}ms)`);
+    } catch (error) {
+      console.warn('⚠️  Model warm-up failed:', error instanceof Error ? error.message : String(error));
     }
   }
 }

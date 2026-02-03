@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { SkillVerifier } from '../security/skill-verifier.js';
+import { CredentialManager } from '../security/credential-manager.js';
 
 export interface SkillExecutionResult {
   success: boolean;
@@ -11,10 +12,12 @@ export interface SkillExecutionResult {
 export class SkillManager {
   private skillsPath: string;
   private verifier: SkillVerifier;
+  private credentialManager?: CredentialManager;
   
-  constructor(skillsPath: string = 'skills') {
+  constructor(skillsPath: string = 'skills', credentialManager?: CredentialManager) {
     this.skillsPath = skillsPath;
-    this.verifier = new SkillVerifier(skillsPath);
+    this.credentialManager = credentialManager;
+    this.verifier = new SkillVerifier(skillsPath, credentialManager);
   }
   
   getVerifier(): SkillVerifier {
@@ -29,6 +32,19 @@ export class SkillManager {
         success: false,
         error: `Skill '${skillName}' is not verified or hash mismatch. Execution denied.`
       };
+    }
+    
+    if (this.credentialManager) {
+      const validation = this.credentialManager.validateSkillCredentials(skillName);
+      if (!validation.valid) {
+        const details = validation.missing.length > 0
+          ? `Missing required credentials: ${validation.missing.join(', ')}`
+          : 'Credentials require confirmation after manifest change';
+        return {
+          success: false,
+          error: `Skill '${skillName}' cannot run. ${details}`
+        };
+      }
     }
     
     const skillPath = join(this.skillsPath, skillName);

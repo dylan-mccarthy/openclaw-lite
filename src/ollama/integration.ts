@@ -56,9 +56,11 @@ export class OllamaIntegration {
     forceModel?: string
   ): Promise<CompletionResult> {
     const startTime = Date.now();
+    console.log(`[DEBUG] complete() called with ${messages.length} messages, systemPrompt length: ${systemPrompt.length}, forceModel: ${forceModel || 'none'}`);
     
     // 1. Analyze task if not provided
     const task = taskRequirements || this.analyzeTask(messages, systemPrompt);
+    console.log(`[DEBUG] Task analyzed`);
     
     // 2. Select appropriate model
     let modelId: string;
@@ -88,10 +90,12 @@ export class OllamaIntegration {
         }
       } catch (error) {
         // Fall back to default Ollama model
-        console.warn(`Model selection failed: ${error instanceof Error ? error.message : String(error)}, using default`);
+        console.warn(`[DEBUG] Model selection failed: ${error instanceof Error ? error.message : String(error)}, using default`);
         modelId = `ollama/${(this.ollama as any).defaultModel}`;
       }
     }
+    
+    console.log(`[DEBUG] Final modelId: ${modelId}`);
     
     // 3. Compress context if needed
     const compressionResult = await this.contextManager.compressHistory(
@@ -99,6 +103,7 @@ export class OllamaIntegration {
       systemPrompt,
       modelId
     );
+    console.log(`[DEBUG] Context compressed: ${messages.length} -> ${compressionResult.messages.length} messages`);
     
     // 4. Estimate tokens
     const estimator = modelId.startsWith('ollama/')
@@ -107,31 +112,65 @@ export class OllamaIntegration {
     
     const inputTokens = estimator.estimateMessages(compressionResult.messages) + 
                        estimator.estimate(systemPrompt);
+    console.log(`[DEBUG] Estimated input tokens: ${inputTokens}`);
     
     // 5. Call Ollama
     const ollamaModel = modelId.replace('ollama/', '');
-    const ollamaResponse = await this.ollama.chat(
-      compressionResult.messages,
-      systemPrompt,
-      {
-        model: ollamaModel,
-        options: {
-          num_predict: task.estimatedOutputTokens || 2048,
-          temperature: 0.7,
-        },
-      }
-    );
     
-    const endTime = Date.now();
+    console.log(`[DEBUG] Calling Ollama with model: ${ollamaModel}, messages: ${compressionResult.messages.length}, system prompt length: ${systemPrompt.length}`);
+    
+    let ollamaResponse;
+    try {
+      const ollamaStart = Date.now();
+      ollamaResponse = await this.ollama.chat(
+        compressionResult.messages,
+        systemPrompt,
+        {
+          model: ollamaModel,
+          timeout: 120000, // 120 second timeout for large models
+          options: {
+            num_predict: task.estimatedOutputTokens || 2048,
+            temperature: 0.7,
+          },
+        }
+      );
+      const ollamaDuration = Date.now() - ollamaStart;
+      console.log(`[DEBUG] Ollama response received for model: ${ollamaModel} in ${ollamaDuration}ms`);
+      console.log(`[DEBUG] Ollama response keys: ${Object.keys(ollamaResponse).join(', ')}`);
+      console.log(`[DEBUG] Ollama response has message?.content: ${!!ollamaResponse.message?.content}`);
+      console.log(`[DEBUG] Ollama response has response: ${!!ollamaResponse.response}`);
+      console.log(`[DEBUG] Ollama response eval_count: ${ollamaResponse.eval_count}`);
+      console.log(`[DEBUG] Ollama response total_duration: ${ollamaResponse.total_duration}`);
+    } catch (error) {
+      console.error(`[DEBUG] Ollama chat failed for ${ollamaModel}:`, error);
+      throw error;
+    }
     
     // 6. Extract response text (handle both chat and generate formats)
     const responseText = ollamaResponse.message?.content || 
                         ollamaResponse.response || 
                         'No response generated';
     
+    console.log(`[DEBUG] Extracted response text length: ${responseText.length}`);
+    console.log(`[DEBUG] Response preview (first 200 chars): ${responseText.substring(0, 200).replace(/\n/g, '\\n')}`);
+    
+    // Check for thinking tags
+    const hasThinkingTags = responseText.includes('<think>');
+    console.log(`[DEBUG] Response has thinking tags: ${hasThinkingTags}`);
+    if (hasThinkingTags) {
+      const thinkMatch = responseText.match(/<think>([\s\S]*?)<\/think>/);
+      if (thinkMatch) {
+        console.log(`[DEBUG] Thinking content length: ${thinkMatch[1].length}`);
+      }
+    }
+    
     // 7. Calculate output tokens
     const outputTokens = ollamaResponse.eval_count || 
                         estimator.estimate(responseText);
+    console.log(`[DEBUG] Output tokens: ${outputTokens} (eval_count: ${ollamaResponse.eval_count || 'not provided'})`);
+    
+    const endTime = Date.now();
+    console.log(`[DEBUG] Returning completion result, total time: ${endTime - startTime}ms`);
     
     return {
       response: responseText,

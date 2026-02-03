@@ -68,6 +68,63 @@ export class OllamaClient {
     };
   }
   
+  async *streamGenerate(
+    prompt: string,
+    options: OllamaRequestOptions = {}
+  ): AsyncGenerator<{ chunk: string; done: boolean }, void, unknown> {
+    const request: OllamaCompletionRequest = {
+      model: options.model || this.defaultModel,
+      prompt,
+      stream: true,
+      options: {
+        ...this.defaultOptions,
+        ...options.options,
+      },
+      system: options.system,
+      context: options.context,
+    };
+    
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}/api/generate`,
+        request,
+        {
+          timeout: options.timeout || 120000,
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          responseType: 'stream',
+        }
+      );
+      
+      const stream = response.data;
+      
+      for await (const chunk of stream) {
+        const lines = chunk.toString().split('\n').filter((line: string) => line.trim());
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.substring(6);
+            if (data === '[DONE]') {
+              yield { chunk: '', done: true };
+              return;
+            }
+            
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.response) {
+                yield { chunk: parsed.response, done: parsed.done };
+              }
+            } catch (e) {
+              // Ignore parse errors
+            }
+          }
+        }
+      }
+    } catch (error) {
+      throw error;
+    }
+  }
+  
   async generate(
     prompt: string,
     options: OllamaRequestOptions = {}
@@ -89,7 +146,7 @@ export class OllamaClient {
         `${this.baseUrl}/api/generate`,
         request,
         {
-          timeout: options.timeout || 30000, // Increased to 30s for longer responses
+          timeout: options.timeout || 120000, // Increased to 120s for large context models
           headers: {
             'Content-Type': 'application/json',
           },
@@ -158,7 +215,7 @@ export class OllamaClient {
         `${this.baseUrl}/api/chat`,
         request,
         {
-          timeout: options.timeout || 30000,
+          timeout: options.timeout || 120000, // Increased to 120s for large context models
           headers: {
             'Content-Type': 'application/json',
           },
@@ -172,6 +229,86 @@ export class OllamaClient {
         return this.generateWithContext(messages, systemPrompt, options);
       }
       throw error;
+    }
+  }
+  
+  async *streamChat(
+    messages: Message[],
+    systemPrompt: string = '',
+    options: OllamaRequestOptions = {}
+  ): AsyncGenerator<{ chunk: string; done: boolean }, void, unknown> {
+    // Convert messages to chat format
+    const chatMessages: Array<{ role: string; content: string }> = [];
+    
+    if (systemPrompt) {
+      chatMessages.push({
+        role: 'system',
+        content: systemPrompt,
+      });
+    }
+    
+    for (const msg of messages) {
+      chatMessages.push({
+        role: msg.role,
+        content: msg.content,
+      });
+    }
+    
+    const request = {
+      model: options.model || this.defaultModel,
+      messages: chatMessages,
+      stream: true,
+      options: {
+        ...this.defaultOptions,
+        ...options.options,
+      },
+    };
+    
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}/api/chat`,
+        request,
+        {
+          timeout: options.timeout || 120000,
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          responseType: 'stream',
+        }
+      );
+      
+      const stream = response.data;
+      
+      for await (const chunk of stream) {
+        const lines = chunk.toString().split('\n').filter((line: string) => line.trim());
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.substring(6);
+            if (data === '[DONE]') {
+              yield { chunk: '', done: true };
+              return;
+            }
+            
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.message?.content) {
+                yield { chunk: parsed.message.content, done: parsed.done };
+              }
+            } catch (e) {
+              // Ignore parse errors
+            }
+          }
+        }
+      }
+    } catch (error) {
+      // Fall back to generate streaming if chat isn't supported
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        // Combine messages into a single prompt for generate
+        const prompt = chatMessages.map(m => `${m.role}: ${m.content}`).join('\n');
+        yield* this.streamGenerate(prompt, options);
+      } else {
+        throw error;
+      }
     }
   }
   
