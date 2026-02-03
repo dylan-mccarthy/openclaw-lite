@@ -1,11 +1,12 @@
 import { ContextManager } from '../context/context-manager.js';
 import { ModelRouter } from '../context/model-router.js';
 import { TokenEstimator } from '../context/token-estimator.js';
-import { OllamaClient, type OllamaOptions } from './client.js';
+import { OpenAIOllamaClient, type OpenAIOllamaOptions } from './openai-client.js';
+import { ModelTemplateRegistry } from './model-templates.js';
 import type { Message, TaskRequirements } from '../context/types.js';
 
 export interface OllamaIntegrationOptions {
-  ollama?: OllamaOptions;
+  ollama?: OpenAIOllamaOptions;
   context?: {
     maxContextTokens?: number;
     compressionStrategy?: 'truncate' | 'selective' | 'hybrid';
@@ -37,16 +38,18 @@ export interface CompletionResult {
 }
 
 export class OllamaIntegration {
-  private ollama: OllamaClient;
+  private ollama: OpenAIOllamaClient;
   private contextManager: ContextManager;
   private modelRouter: ModelRouter;
   private tokenEstimator: TokenEstimator;
+  private templateRegistry: ModelTemplateRegistry;
   
   constructor(options: OllamaIntegrationOptions = {}) {
-    this.ollama = new OllamaClient(options.ollama);
+    this.ollama = new OpenAIOllamaClient(options.ollama);
     this.contextManager = new ContextManager(options.context);
     this.modelRouter = new ModelRouter();
     this.tokenEstimator = new TokenEstimator();
+    this.templateRegistry = new ModelTemplateRegistry();
   }
   
   async complete(
@@ -114,42 +117,39 @@ export class OllamaIntegration {
                        estimator.estimate(systemPrompt);
     console.log(`[DEBUG] Estimated input tokens: ${inputTokens}`);
     
-    // 5. Call Ollama
+    // 5. Call Ollama using OpenAI-compatible API
     const ollamaModel = modelId.replace('ollama/', '');
     
     console.log(`[DEBUG] Calling Ollama with model: ${ollamaModel}, messages: ${compressionResult.messages.length}, system prompt length: ${systemPrompt.length}`);
     
-    let ollamaResponse;
+    let openaiResponse;
     try {
       const ollamaStart = Date.now();
-      ollamaResponse = await this.ollama.chat(
-        compressionResult.messages,
-        systemPrompt,
-        {
-          model: ollamaModel,
-          timeout: 120000, // 120 second timeout for large models
-          options: {
-            num_predict: task.estimatedOutputTokens || 2048,
-            temperature: 0.7,
-          },
-        }
-      );
+      
+      // Convert messages to OpenAI format
+      const openaiMessages = this.convertToOpenAIMessages(compressionResult.messages, systemPrompt);
+      
+      // Call OpenAI-compatible endpoint
+      openaiResponse = await this.ollama.chatCompletion(openaiMessages, {
+        model: ollamaModel,
+        temperature: 0.7,
+        max_tokens: task.estimatedOutputTokens || 2048,
+        timeout: 120000,
+      });
+      
       const ollamaDuration = Date.now() - ollamaStart;
       console.log(`[DEBUG] Ollama response received for model: ${ollamaModel} in ${ollamaDuration}ms`);
-      console.log(`[DEBUG] Ollama response keys: ${Object.keys(ollamaResponse).join(', ')}`);
-      console.log(`[DEBUG] Ollama response has message?.content: ${!!ollamaResponse.message?.content}`);
-      console.log(`[DEBUG] Ollama response has response: ${!!ollamaResponse.response}`);
-      console.log(`[DEBUG] Ollama response eval_count: ${ollamaResponse.eval_count}`);
-      console.log(`[DEBUG] Ollama response total_duration: ${ollamaResponse.total_duration}`);
+      console.log(`[DEBUG] OpenAI response keys: ${Object.keys(openaiResponse).join(', ')}`);
+      console.log(`[DEBUG] OpenAI response has choices: ${!!openaiResponse.choices}`);
+      console.log(`[DEBUG] OpenAI response usage: ${JSON.stringify(openaiResponse.usage)}`);
+      
     } catch (error) {
-      console.error(`[DEBUG] Ollama chat failed for ${ollamaModel}:`, error);
+      console.error(`[DEBUG] Ollama OpenAI API failed for ${ollamaModel}:`, error);
       throw error;
     }
     
-    // 6. Extract response text (handle both chat and generate formats)
-    const responseText = ollamaResponse.message?.content || 
-                        ollamaResponse.response || 
-                        'No response generated';
+    // 6. Extract response text
+    const responseText = openaiResponse.choices?.[0]?.message?.content || 'No response generated';
     
     console.log(`[DEBUG] Extracted response text length: ${responseText.length}`);
     console.log(`[DEBUG] Response preview (first 200 chars): ${responseText.substring(0, 200).replace(/\n/g, '\\n')}`);
@@ -165,9 +165,9 @@ export class OllamaIntegration {
     }
     
     // 7. Calculate output tokens
-    const outputTokens = ollamaResponse.eval_count || 
+    const outputTokens = openaiResponse.usage?.completion_tokens || 
                         estimator.estimate(responseText);
-    console.log(`[DEBUG] Output tokens: ${outputTokens} (eval_count: ${ollamaResponse.eval_count || 'not provided'})`);
+    console.log(`[DEBUG] Output tokens: ${outputTokens} (completion_tokens: ${openaiResponse.usage?.completion_tokens || 'not provided'})`);
     
     const endTime = Date.now();
     console.log(`[DEBUG] Returning completion result, total time: ${endTime - startTime}ms`);
@@ -176,17 +176,13 @@ export class OllamaIntegration {
       response: responseText,
       modelUsed: modelId,
       tokens: {
-        input: inputTokens,
+        input: openaiResponse.usage?.prompt_tokens || inputTokens,
         output: outputTokens,
-        total: inputTokens + outputTokens,
+        total: (openaiResponse.usage?.total_tokens || inputTokens + outputTokens),
       },
-      timing: ollamaResponse.total_duration ? {
-        total: ollamaResponse.total_duration,
-        promptEval: ollamaResponse.prompt_eval_duration || 0,
-        eval: ollamaResponse.eval_duration || 0,
-      } : {
+      timing: {
         total: endTime - startTime,
-        promptEval: 0,
+        promptEval: 0, // Not available from OpenAI API
         eval: 0,
       },
       context: {
@@ -195,6 +191,40 @@ export class OllamaIntegration {
         compressionRatio: compressionResult.compressionRatio,
       },
     };
+  }
+  
+  private convertToOpenAIMessages(messages: Message[], systemPrompt: string): any[] {
+    const openaiMessages: any[] = [];
+    
+    // Add system prompt if provided
+    if (systemPrompt && systemPrompt.trim().length > 0) {
+      openaiMessages.push({
+        role: 'system',
+        content: systemPrompt
+      });
+    }
+    
+    // Convert user/assistant messages
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        // Combine with existing system prompt or add as separate system message
+        if (openaiMessages.length > 0 && openaiMessages[0].role === 'system') {
+          openaiMessages[0].content += '\n\n' + msg.content;
+        } else {
+          openaiMessages.unshift({
+            role: 'system',
+            content: msg.content
+          });
+        }
+      } else {
+        openaiMessages.push({
+          role: msg.role,
+          content: msg.content
+        });
+      }
+    }
+    
+    return openaiMessages;
   }
   
   async simpleComplete(
@@ -260,7 +290,7 @@ export class OllamaIntegration {
     };
   }
   
-  updateOllamaConfig(options: Partial<OllamaOptions>): void {
+  updateOllamaConfig(options: Partial<OpenAIOllamaOptions>): void {
     this.ollama.updateOptions(options);
   }
   
