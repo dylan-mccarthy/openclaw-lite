@@ -8,8 +8,7 @@ import { ModelRouter } from '../context/model-router.js';
 import { TokenEstimator } from '../context/token-estimator.js';
 import { OllamaIntegration } from '../ollama/integration.js';
 import { getConfigManager } from '../config/config.js';
-import { FileSecurityManager } from '../security/encryption-manager.js';
-import { getSecurityConfig } from '../config/env.js';
+import { join, basename } from 'path';
 import type { Message } from '../context/types.js';
 
 const program = new Command();
@@ -381,21 +380,37 @@ program
   .option('-e, --encrypt', 'Encrypt sensitive files in workspace')
   .option('-d, --decrypt', 'Decrypt sensitive files in workspace (to stdout)')
   .option('-s, --status', 'Show encryption status of sensitive files')
+  .option('-i, --init', 'Initialize secure storage with new encryption key')
   .action(async (options) => {
-    const security = getSecurityConfig();
     const workspace = process.env.OPENCLAW_WORKSPACE || process.cwd();
+    const { FileLoader } = await import('../identity/file-loader.js');
+    const fileLoader = new FileLoader(workspace);
     
-    if (!security.encryptionKey) {
-      console.log(chalk.yellow('⚠️  OPENCLAW_ENCRYPTION_KEY is not set.'));
-      console.log(chalk.gray('   Set it in your .env file to enable encryption.'));
+    if (options.init) {
+      console.log(chalk.gray('🔐 Initializing secure storage...'));
+      const { SecureKeyManager } = await import('../security/secure-key-manager.js');
+      const keyManager = new SecureKeyManager();
+      const success = keyManager.initializeSecureStorage();
+      
+      if (success) {
+        console.log(chalk.green('✅ Secure storage initialized'));
+        console.log(chalk.gray('   Key stored in: ~/.clawlite-secure/encryption.key'));
+        console.log(chalk.gray('   Use `claw-lite security --encrypt` to encrypt files'));
+      } else {
+        console.log(chalk.red('❌ Failed to initialize secure storage'));
+      }
       return;
     }
     
-    const manager = new FileSecurityManager(workspace, security.encryptionKey);
-    
     if (options.encrypt) {
+      if (!fileLoader.isEncryptionAvailable()) {
+        console.log(chalk.yellow('⚠️  Encryption not available.'));
+        console.log(chalk.gray('   Run `claw-lite security --init` first to create secure storage.'));
+        return;
+      }
+      
       console.log(chalk.gray('🔐 Encrypting sensitive files...'));
-      manager.ensureAllEncrypted();
+      await fileLoader.ensureEncryptedFiles();
       console.log(chalk.green('✅ Encryption complete'));
       return;
     }
@@ -406,15 +421,29 @@ program
       return;
     }
     
-    if (options.status || (!options.encrypt && !options.decrypt)) {
+    if (options.status || (!options.encrypt && !options.decrypt && !options.init)) {
+      const { SecureKeyManager } = await import('../security/secure-key-manager.js');
+      const keyManager = new SecureKeyManager();
+      const hasSecureStorage = keyManager.isSecureStorageAvailable();
+      const hasDirectAccess = keyManager.hasDirectKeyAccess();
+      
       console.log(chalk.bold('🔐 Encryption Status'));
       console.log(chalk.gray('─'.repeat(60)));
       console.log(`Workspace: ${chalk.cyan(workspace)}`);
-      console.log(`Encryption: ${chalk.green('ENABLED')}`);
-      console.log(`Key source: ${chalk.yellow('OPENCLAW_ENCRYPTION_KEY')}`);
-      console.log(chalk.gray('\nSensitive files will be encrypted at rest:'));
-      console.log(chalk.gray('  SOUL.md, USER.md, IDENTITY.md, MEMORY.md')); 
-      console.log(chalk.gray('  memory/*.md, AGENTS.md, TOOLS.md, HEARTBEAT.md')); 
+      console.log(`Secure storage: ${hasSecureStorage ? chalk.green('AVAILABLE') : chalk.yellow('NOT CONFIGURED')}`);
+      console.log(`Key access: ${hasDirectAccess ? chalk.yellow('DIRECT (less secure)') : chalk.green('ISOLATED')}`);
+      
+      if (fileLoader.isEncryptionAvailable()) {
+        console.log(`Encryption: ${chalk.green('ENABLED')}`);
+        console.log(chalk.gray('\nSensitive files will be encrypted at rest:'));
+        console.log(chalk.gray('  SOUL.md, USER.md, IDENTITY.md, MEMORY.md')); 
+        console.log(chalk.gray('  memory/*.md, AGENTS.md, TOOLS.md, HEARTBEAT.md'));
+      } else {
+        console.log(`Encryption: ${chalk.yellow('NOT AVAILABLE')}`);
+        console.log(chalk.gray('\nTo enable encryption:'));
+        console.log(chalk.cyan('  claw-lite security --init'));
+        console.log(chalk.cyan('  claw-lite security --encrypt'));
+      }
       return;
     }
   });
@@ -590,6 +619,165 @@ program
       console.log(`  ${chalk.cyan('claw-lite memory --clean')} - Clean up old sessions`);
       console.log(`  ${chalk.cyan('claw-lite chat --save')} - Save chat sessions`);
     }
+  });
+
+// Skills command
+program
+  .command('skills')
+  .description('Manage and verify AI skills')
+  .option('-l, --list', 'List installed skills')
+  .option('-v, --verify <name>', 'Verify a specific skill')
+  .option('-i, --install <path>', 'Install and verify a skill from local path')
+  .option('-u, --uninstall <name>', 'Uninstall a skill')
+  .option('-s, --scan <path>', 'Scan a skill directory for safety issues')
+  .action(async (options) => {
+    const workspace = process.env.OPENCLAW_WORKSPACE || process.cwd();
+    const skillsPath = join(workspace, 'skills');
+    
+    const { SkillVerifier } = await import('../security/skill-verifier.js');
+    const verifier = new SkillVerifier(skillsPath);
+    
+    if (options.list) {
+      const skills = verifier.listSkills();
+      
+      console.log(chalk.bold('🧠 Installed Skills'));
+      console.log(chalk.gray('─'.repeat(60)));
+      
+      if (skills.length === 0) {
+        console.log(chalk.gray('No skills installed.'));
+        console.log(chalk.gray('Install with: claw-lite skills --install <path>'));
+        return;
+      }
+      
+      skills.forEach(skill => {
+        const verified = skill.verified ? chalk.green('✅') : chalk.yellow('⚠️');
+        const date = new Date(skill.installedAt).toLocaleDateString();
+        
+        console.log(`${verified} ${chalk.bold(skill.name)} v${skill.version}`);
+        console.log(`  ${chalk.gray('Hash:')} ${skill.hash.substring(0, 16)}...`);
+        console.log(`  ${chalk.gray('Installed:')} ${date}`);
+        console.log(`  ${chalk.gray('Verified:')} ${skill.verified ? 'Yes' : 'No'}`);
+        console.log();
+      });
+      return;
+    }
+    
+    if (options.verify) {
+      const skillName = options.verify;
+      const verified = verifier.verifySkill(skillName);
+      
+      if (verified) {
+        console.log(chalk.green(`✅ Skill "${skillName}" is verified and safe`));
+      } else {
+        console.log(chalk.red(`❌ Skill "${skillName}" is not verified or failed safety check`));
+        console.log(chalk.gray('   Reinstall with: claw-lite skills --install <path>'));
+      }
+      return;
+    }
+    
+    if (options.install) {
+      const sourcePath = options.install;
+      const skillName = basename(sourcePath);
+      
+      console.log(chalk.gray(`📦 Installing skill "${skillName}"...`));
+      
+      try {
+        const result = verifier.installSkill(sourcePath, skillName);
+        
+        if (result.safe) {
+          console.log(chalk.green(`✅ Skill "${skillName}" installed and verified`));
+          console.log(chalk.gray(`   Files: ${result.fileCount}`));
+          console.log(chalk.gray(`   Hash: ${result.hash}`));
+          
+          if (result.warnings.length > 0) {
+            console.log(chalk.yellow('\n⚠️  Warnings:'));
+            result.warnings.forEach(warning => {
+              console.log(chalk.gray(`   • ${warning}`));
+            });
+          }
+        } else {
+          console.log(chalk.red(`❌ Skill "${skillName}" failed safety check`));
+          console.log(chalk.yellow('\nIssues found:'));
+          result.issues.forEach(issue => {
+            console.log(chalk.gray(`   • ${issue}`));
+          });
+        }
+      } catch (error) {
+        console.log(chalk.red(`❌ Failed to install skill: ${error instanceof Error ? error.message : String(error)}`));
+      }
+      return;
+    }
+    
+    if (options.uninstall) {
+      const skillName = options.uninstall;
+      const success = verifier.uninstallSkill(skillName);
+      
+      if (success) {
+        console.log(chalk.green(`✅ Skill "${skillName}" uninstalled`));
+      } else {
+        console.log(chalk.red(`❌ Skill "${skillName}" not found or failed to uninstall`));
+      }
+      return;
+    }
+    
+    if (options.scan) {
+      const sourcePath = options.scan;
+      const skillName = basename(sourcePath);
+      
+      console.log(chalk.gray(`🔍 Scanning "${skillName}" for safety issues...`));
+      
+      try {
+        const result = verifier.scanSkillDirectory(sourcePath);
+        
+        console.log(chalk.bold(`📊 Scan Results for "${skillName}"`));
+        console.log(chalk.gray('─'.repeat(60)));
+        console.log(`Safety: ${result.safe ? chalk.green('PASS') : chalk.red('FAIL')}`);
+        console.log(`Files: ${result.fileCount}`);
+        console.log(`Hash: ${result.hash}`);
+        
+        if (result.issues.length > 0) {
+          console.log(chalk.yellow('\n❌ Safety Issues:'));
+          result.issues.forEach(issue => {
+            console.log(chalk.gray(`   • ${issue}`));
+          });
+        }
+        
+        if (result.warnings.length > 0) {
+          console.log(chalk.yellow('\n⚠️  Warnings:'));
+          result.warnings.forEach(warning => {
+            console.log(chalk.gray(`   • ${warning}`));
+          });
+        }
+        
+        if (result.safe && result.issues.length === 0) {
+          console.log(chalk.green('\n✅ Skill appears safe for installation'));
+        } else {
+          console.log(chalk.red('\n❌ Skill should not be installed'));
+        }
+      } catch (error) {
+        console.log(chalk.red(`❌ Failed to scan skill: ${error instanceof Error ? error.message : String(error)}`));
+      }
+      return;
+    }
+    
+    // Default: show help
+    console.log(chalk.bold('🧠 Skill Management'));
+    console.log(chalk.gray('─'.repeat(60)));
+    console.log(chalk.gray('Manage AI skills with safety verification'));
+    console.log();
+    console.log(chalk.cyan('Usage:'));
+    console.log(`  ${chalk.cyan('claw-lite skills --list')} - List installed skills`);
+    console.log(`  ${chalk.cyan('claw-lite skills --verify <name>')} - Verify a skill`);
+    console.log(`  ${chalk.cyan('claw-lite skills --install <path>')} - Install from local path`);
+    console.log(`  ${chalk.cyan('claw-lite skills --uninstall <name>')} - Uninstall a skill`);
+    console.log(`  ${chalk.cyan('claw-lite skills --scan <path>')} - Scan for safety issues`);
+    console.log();
+    console.log(chalk.gray('Skills are verified for:'));
+    console.log(chalk.gray('  • Prompt injection patterns'));
+    console.log(chalk.gray('  • Code execution attempts'));
+    console.log(chalk.gray('  • File system access'));
+    console.log(chalk.gray('  • Network requests'));
+    console.log(chalk.gray('  • Binary data in text files'));
   });
 
 // Test command
