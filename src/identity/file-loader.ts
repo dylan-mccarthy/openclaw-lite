@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { FileSecurityManager } from '../security/encryption-manager.js';
-import { getSecurityConfig } from '../config/env.js';
+import { SecureKeyManager, getEncryptionKeyFromSecureStorage } from '../security/secure-key-manager.js';
 
 export interface Identity {
   soul?: string;
@@ -14,13 +14,62 @@ export interface Identity {
 export class FileLoader {
   private workspacePath: string;
   private securityManager: FileSecurityManager | null = null;
+  private keyManager: SecureKeyManager;
+  private encryptionEnabled: boolean = false;
   
   constructor(workspacePath: string = process.cwd()) {
     this.workspacePath = workspacePath;
+    this.keyManager = new SecureKeyManager();
     
-    const security = getSecurityConfig();
-    if (security.encryptionKey) {
-      this.securityManager = new FileSecurityManager(this.workspacePath, security.encryptionKey);
+    // Check if we have encryption available
+    this.encryptionEnabled = this.keyManager.isSecureStorageAvailable();
+    
+    if (this.encryptionEnabled) {
+      // Try to get encryption key
+      const encryptionKey = getEncryptionKeyFromSecureStorage();
+      if (encryptionKey) {
+        this.securityManager = new FileSecurityManager(this.workspacePath, encryptionKey);
+      } else {
+        console.warn('⚠️  Secure storage exists but encryption key not accessible');
+      }
+    }
+  }
+  
+  isEncryptionAvailable(): boolean {
+    return this.encryptionEnabled && this.securityManager !== null;
+  }
+  
+  async ensureEncryptedFiles(): Promise<void> {
+    if (this.securityManager) {
+      // Check and encrypt sensitive files
+      const sensitiveFiles = [
+        'SOUL.md',
+        'USER.md',
+        'IDENTITY.md',
+        'MEMORY.md',
+        'AGENTS.md',
+        'TOOLS.md',
+        'HEARTBEAT.md'
+      ];
+      
+      for (const file of sensitiveFiles) {
+        const filePath = path.join(this.workspacePath, file);
+        if (fs.existsSync(filePath)) {
+          this.securityManager.ensureEncrypted(file);
+        }
+      }
+      
+      // Check memory directory
+      const memoryDir = path.join(this.workspacePath, 'memory');
+      if (fs.existsSync(memoryDir)) {
+        const files = fs.readdirSync(memoryDir)
+          .filter(file => file.endsWith('.md') && file.match(/^\d{4}-\d{2}-\d{2}\.md$/));
+        
+        for (const file of files) {
+          const relativePath = path.join('memory', file).replace(/\\/g, '/');
+          this.securityManager.ensureEncrypted(relativePath);
+        }
+      }
     }
   }
   

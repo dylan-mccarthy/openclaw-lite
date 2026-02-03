@@ -87,6 +87,7 @@ export class ConsoleUI {
   async start() {
     console.clear();
     this.printHeader();
+    await this.checkEncryption();
     await this.loadIdentity();
     await this.checkOllama();
     await this.mainLoop();
@@ -110,6 +111,26 @@ ${chalk.gray('─'.repeat(60))}
 `;
     
     console.log(header);
+  }
+  
+  private async checkEncryption() {
+    process.stdout.write(chalk.gray('🔐 Checking encryption... '));
+    
+    try {
+      if (this.fileLoader.isEncryptionAvailable()) {
+        console.log(chalk.green('✅ Available\n'));
+        console.log(chalk.gray('   Sensitive files will be encrypted at rest'));
+        await this.fileLoader.ensureEncryptedFiles();
+      } else {
+        console.log(chalk.yellow('⚠️  Not configured\n'));
+        console.log(chalk.gray('   Run `scripts/secure-install.sh` to enable encryption'));
+      }
+    } catch (error) {
+      console.log(chalk.yellow('⚠️  Failed\n'));
+      console.log(chalk.gray(`   ${error instanceof Error ? error.message : String(error)}`));
+    }
+    
+    console.log(chalk.gray('─'.repeat(60)));
   }
   
   private async loadIdentity() {

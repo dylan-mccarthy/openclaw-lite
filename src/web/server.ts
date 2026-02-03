@@ -54,7 +54,8 @@ export class WebServer {
       }
     });
     
-    this.fileLoader = new FileLoader(process.env.OPENCLAW_WORKSPACE || process.cwd());
+    const workspacePath = process.env.OPENCLAW_WORKSPACE || process.cwd();
+    this.fileLoader = new FileLoader(workspacePath);
     
     // Initialize memory manager if enabled
     try {
@@ -738,7 +739,22 @@ export class WebServer {
   }
   
   async start() {
-    // Load identity files first
+    // Check and ensure encryption for sensitive files
+    console.log('🔐 Checking encryption status...');
+    
+    try {
+      if (this.fileLoader.isEncryptionAvailable()) {
+        console.log('✅ Encryption available - ensuring sensitive files are encrypted');
+        await this.fileLoader.ensureEncryptedFiles();
+      } else {
+        console.log('⚠️  Encryption not configured - sensitive files will be stored in plain text');
+        console.log('   Run `scripts/secure-install.sh` to enable encryption');
+      }
+    } catch (error) {
+      console.log('⚠️  Encryption check failed:', error instanceof Error ? error.message : String(error));
+    }
+    
+    // Load identity files
     console.log('📚 Loading identity files...');
     
     try {
