@@ -19,9 +19,9 @@ export class SecureKeyManager {
   
   constructor(config: Partial<KeyManagerConfig> = {}) {
     this.config = {
-      secureStoragePath: join(process.env.HOME || '', '.clawlite-secure'),
+      secureStoragePath: join(process.env.HOME || '', '.openclaw-lite', 'secure'),
       keyFileName: 'encryption.key',
-      wrapperScriptPath: join(process.env.HOME || '', '.clawlite', 'claw-lite-secure'),
+      wrapperScriptPath: join(process.env.HOME || '', '.openclaw-lite', 'claw-lite-secure'),
       ...config
     };
   }
@@ -232,7 +232,7 @@ export class SecureKeyManager {
  */
 export function isSecureEnvironment(): boolean {
   // Check for secure storage
-  const securePath = join(process.env.HOME || '', '.clawlite-secure');
+  const securePath = join(process.env.HOME || '', '.openclaw-lite', 'secure');
   const keyPath = join(securePath, 'encryption.key');
   
   return existsSync(securePath) && existsSync(keyPath);
@@ -244,7 +244,7 @@ export function isSecureEnvironment(): boolean {
  */
 export function getEncryptionKeyFromSecureStorage(): string | null {
   try {
-    const securePath = process.env.OPENCLAW_SECURE_STORAGE || join(process.env.HOME || '', '.clawlite-secure');
+    const securePath = process.env.OPENCLAW_SECURE_STORAGE || join(process.env.HOME || '', '.openclaw-lite', 'secure');
     const keyPath = join(securePath, 'encryption.key');
     
     if (existsSync(keyPath)) {

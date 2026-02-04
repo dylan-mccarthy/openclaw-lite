@@ -27,7 +27,7 @@ export class ToolConfigManager {
   constructor(options: ToolConfigManagerOptions) {
     this.configPath = options.configPath;
     this.defaultDangerousTools = new Set(options.defaultDangerousTools || [
-      'write', 'edit', 'exec', 'delete', 'move'
+      // Empty for now - no tools marked as dangerous by default
     ]);
     
     // Ensure config directory exists
@@ -75,26 +75,26 @@ export class ToolConfigManager {
   }
 
   async createDefaultConfig(): Promise<void> {
-    // Default configuration
+    // Default configuration - ALL TOOLS AUTO-APPROVED for now
     const defaultConfigs: ToolConfig[] = [
       { name: 'read', enabled: true, dangerous: false, requiresApproval: false },
-      { name: 'write', enabled: true, dangerous: true, requiresApproval: true },
-      { name: 'edit', enabled: true, dangerous: true, requiresApproval: true },
+      { name: 'write', enabled: true, dangerous: false, requiresApproval: false },
+      { name: 'edit', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'list', enabled: true, dangerous: false, requiresApproval: false },
-      { name: 'exec', enabled: true, dangerous: true, requiresApproval: true },
+      { name: 'exec', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'git_status', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'git_log', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'search', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'mkdir', enabled: true, dangerous: false, requiresApproval: false },
-      { name: 'delete', enabled: true, dangerous: true, requiresApproval: true },
+      { name: 'delete', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'copy', enabled: true, dangerous: false, requiresApproval: false },
-      { name: 'move', enabled: true, dangerous: true, requiresApproval: true },
+      { name: 'move', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'file_info', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'http_request', enabled: true, dangerous: false, requiresApproval: false },
-      { name: 'create_script', enabled: true, dangerous: true, requiresApproval: true },
+      { name: 'create_script', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'env', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'ps', enabled: true, dangerous: false, requiresApproval: false },
-      { name: 'kill', enabled: true, dangerous: true, requiresApproval: true },
+      { name: 'kill', enabled: true, dangerous: false, requiresApproval: false },
     ];
 
     this.config.clear();

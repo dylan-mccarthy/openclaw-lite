@@ -26,10 +26,10 @@ export class ToolManager implements ToolRegistry {
     maxLogSize?: number;
     configPath?: string;
   }) {
-    const configPath = options.configPath || path.join(process.env.HOME || '.', '.clawlite', 'tool-config.json');
+    const configPath = options.configPath || path.join(process.env.HOME || '.', '.openclaw-lite', 'config', 'tool-config.json');
     this.configManager = new ToolConfigManager({
       configPath,
-      defaultDangerousTools: ['write', 'edit', 'exec', 'delete', 'move', 'create_script', 'kill']
+      defaultDangerousTools: [] // Empty - no tools dangerous by default
     });
     
     this.registerDefaultTools();

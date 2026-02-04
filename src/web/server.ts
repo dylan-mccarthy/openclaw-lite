@@ -1,12 +1,19 @@
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import os from 'os';
 import { OllamaIntegration } from '../ollama/integration.js';
 import { FileLoader } from '../identity/file-loader.js';
 import { MemoryManager } from '../memory/memory-manager.js';
 import { ToolManager } from '../tools/tool-manager.js';
 import { OpenClawToolIntegration } from '../tools/openclaw-tool-integration.js';
-import { getConfigManager } from '../config/config.js';
+import { AgentIntegration } from '../agent/agent-integration.js';
+import { MemoryIntegration } from '../agent/memory-integration.js';
+import { MemoryStreamingAgent } from '../agent/memory-streaming-agent.js';
+import { getConfigManager, initializeConfigSync } from '../config/openclaw-lite-config.js';
+import { createDefaultBasicPrompt } from '../agent/basic-prompt.js';
+import { PersonalityUpdater } from '../identity/personality-updater.js';
+import { UserInfoUpdater } from '../identity/user-info-updater.js';
 import type { Message } from '../context/types.js';
 import type { ToolCall, ToolUsageLog } from '../tools/types.js';
 
@@ -23,18 +30,23 @@ export class WebServer {
   private app: express.Application;
   private integration: OllamaIntegration;
   private toolIntegration: OpenClawToolIntegration | null = null;
+  private agentIntegration: AgentIntegration | null = null;
+  private memoryStreamingAgent: MemoryStreamingAgent | null = null;
+  private memoryIntegration: MemoryIntegration | null = null;
   private fileLoader: FileLoader;
   private toolManager: ToolManager;
   private memoryManager: MemoryManager | null = null;
+  private personalityUpdater: PersonalityUpdater | null = null;
+  private userInfoUpdater: UserInfoUpdater | null = null;
   private options: Required<WebServerOptions>;
   private systemPrompt: string = '';
   private pendingApprovals: Map<string, { call: ToolCall; resolve: (approved: boolean) => void }> = new Map();
   
   constructor(options: WebServerOptions = {}) {
     // Load default model from config
-    let defaultModel = 'llama3.1:8b';
+    let defaultModel = 'Qwen3-4B-Instruct-2507:latest';
     try {
-      const configManager = getConfigManager();
+      const configManager = initializeConfigSync();
       const config = configManager.getConfig();
       defaultModel = config.ollama.defaultModel;
     } catch (error) {
@@ -61,21 +73,24 @@ export class WebServer {
       }
     });
     
-    const workspacePath = process.env.OPENCLAW_WORKSPACE || process.cwd();
+    // Initialize configuration synchronously
+    const configManager = initializeConfigSync();
+    const config = configManager.getConfig();
+    
+    // Use configured workspace
+    const workspacePath = config.workspace.path;
     this.fileLoader = new FileLoader(workspacePath);
+    console.log(`📁 Workspace: ${workspacePath}`);
     
     // Initialize memory manager if enabled
     try {
-      const configManager = getConfigManager();
-      const config = configManager.getConfig();
-      
       if (config.memory.enabled) {
         this.memoryManager = new MemoryManager({
-          storagePath: config.memory.storagePath,
+          storagePath: configManager.getMemoryPath(),
           maxSessions: config.memory.maxSessions,
           pruneDays: config.memory.pruneDays,
         });
-        console.log('💾 Memory system initialized for web sessions');
+        console.log('💾 Memory system initialized');
       } else {
         console.log('⚠️  Memory system disabled (enable via config)');
       }
@@ -83,13 +98,28 @@ export class WebServer {
       console.warn('Failed to initialize memory manager:', error);
     }
     
+    // Initialize personality updater
+    try {
+      this.personalityUpdater = new PersonalityUpdater(workspacePath);
+      console.log('🧠 Personality updater initialized');
+    } catch (error) {
+      console.warn('Failed to initialize personality updater:', error);
+    }
+    
+    // Initialize user info updater
+    try {
+      this.userInfoUpdater = new UserInfoUpdater(workspacePath);
+      console.log('👤 User info updater initialized');
+    } catch (error) {
+      console.warn('Failed to initialize user info updater:', error);
+    }
+    
     // Initialize tool manager
-    const configPath = path.join(process.env.HOME || '.', '.clawlite', 'tool-config.json');
     this.toolManager = new ToolManager({
       workspacePath,
-      requireApprovalForDangerous: true,
+      requireApprovalForDangerous: config.tools.requireApprovalForDangerous,
       maxLogSize: 1000,
-      configPath
+      configPath: configManager.getToolConfigPath()
     });
     
     console.log('🔧 Tool system initialized');
@@ -107,6 +137,59 @@ export class WebServer {
       }
     );
     console.log('🤖 AI tool calling enabled (OpenClaw style)');
+    
+    // Initialize agent integration (Phase 1)
+    this.agentIntegration = new AgentIntegration({
+      toolManager: this.toolManager,
+      model: this.options.model,
+      temperature: 0.7,
+      maxToolCalls: 5,
+      maxTurns: 10,
+      timeoutMs: 120000,
+      baseUrl: this.options.ollamaUrl,
+      workspacePath: process.cwd(),
+      sessionId: 'web-server',
+    });
+    console.log('🤖 Agent integration enabled (Phase 1)');
+    
+    // Initialize memory streaming agent (Phase 3)
+    if (this.agentIntegration.getAgentLoop() && this.agentIntegration.getToolBridge()) {
+      // Create memory manager if not already created
+      if (!this.memoryManager) {
+        try {
+          const configManager = getConfigManager();
+          const config = configManager.getConfig();
+          
+          this.memoryManager = new MemoryManager({
+            storagePath: config.memory.storagePath,
+            maxSessions: config.memory.maxSessions,
+            pruneDays: config.memory.pruneDays,
+          });
+          console.log('💾 Memory manager created (was disabled in config)');
+        } catch (error) {
+          console.warn('Failed to create memory manager:', error instanceof Error ? error.message : String(error));
+          console.log('⚠️  Memory features will be disabled');
+        }
+      }
+      
+      if (this.memoryManager) {
+        // Create memory integration
+        this.memoryIntegration = new MemoryIntegration(this.memoryManager, {
+          enabled: true,
+          searchLimit: 5,
+        });
+        
+        // Create memory streaming agent
+        this.memoryStreamingAgent = new MemoryStreamingAgent(
+          this.agentIntegration.getAgentLoop(),
+          this.agentIntegration.getToolBridge(),
+          this.memoryIntegration
+        );
+        console.log('🧠 Memory streaming agent enabled (Phase 3)');
+      } else {
+        console.log('⚠️  Memory streaming agent disabled (no memory manager)');
+      }
+    }
     
     this.app = express();
     this.setupMiddleware();
@@ -512,7 +595,7 @@ export class WebServer {
               
               <div class="chat-container" id="chat">
                 <div class="message assistant-message">
-                  Hello! I'm Ada, your AI chaos gremlin. 😏 How can I help you today?
+                  Hello! I'm your OpenClaw Lite assistant. How can I help you today?
                 </div>
               </div>
               
@@ -990,6 +1073,16 @@ export class WebServer {
         console.log(`[WEB] Result model: ${result.modelUsed}`);
         console.log(`[WEB] Result response length: ${result.response.length}`);
         console.log(`[WEB] Result has thinking tags: ${result.response.includes('<think>')}`);
+        
+        // Log conversation for personality analysis
+        if (this.personalityUpdater) {
+          try {
+            this.personalityUpdater.logConversation(message, result.response);
+            console.log(`🧠 Conversation logged for personality analysis`);
+          } catch (error) {
+            console.warn('Failed to log conversation for personality analysis:', error);
+          }
+        }
         
         // Add assistant message
         const assistantMessage: Message = {
@@ -1513,6 +1606,441 @@ export class WebServer {
         });
       }
     });
+    
+    // Phase 1: Agent loop endpoint
+    this.app.post('/api/agent/run', async (req, res) => {
+      console.log(`[WEB] /api/agent/run received request`);
+      const { message, systemPrompt: clientSystemPrompt, model } = req.body;
+      
+      console.log(`[WEB] Agent request: message="${message?.substring(0, 50)}...", model=${model || 'default'}`);
+      
+      if (!message || typeof message !== 'string') {
+        console.log(`[WEB] Invalid request: no message`);
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+      
+      if (!this.agentIntegration) {
+        res.status(500).json({ error: 'Agent integration not available' });
+        return;
+      }
+      
+      try {
+        const startTime = Date.now();
+        console.log(`[WEB] Starting agent loop...`);
+        
+        // Use client system prompt or default
+        const systemPrompt = clientSystemPrompt || this.systemPrompt;
+        
+        // Run agent
+        const result = await this.agentIntegration.run(
+          message,
+          systemPrompt
+        );
+        
+        const responseTime = Date.now() - startTime;
+        console.log(`[WEB] Agent completed in ${responseTime}ms`);
+        console.log(`[WEB] Tool executions: ${result.toolExecutions.length}`);
+        console.log(`[WEB] Turns: ${result.turns}`);
+        
+        // Convert to response format
+        const responseData = {
+          response: result.response,
+          toolExecutions: result.toolExecutions.map(exec => ({
+            tool: exec.toolName,
+            success: exec.success,
+            result: exec.result,
+            error: exec.error,
+            duration: exec.duration,
+          })),
+          messages: result.messages.map(msg => ({
+            role: msg.role,
+            content: msg.content,
+            timestamp: msg.timestamp,
+          })),
+          stats: {
+            turns: result.turns,
+            duration: result.duration,
+            toolCount: result.toolExecutions.length,
+          },
+          timing: {
+            total: responseTime,
+          },
+        };
+        
+        res.json(responseData);
+      } catch (error) {
+        console.error(`[WEB] Error in /api/agent/run:`, error);
+        res.status(500).json({ 
+          error: 'Agent execution failed',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    // Phase 2: Streaming agent endpoint (Server-Sent Events)
+    this.app.post('/api/agent/stream', async (req, res) => {
+      console.log(`[WEB] /api/agent/stream received request (SSE)`);
+      const { message, systemPrompt: clientSystemPrompt } = req.body;
+      
+      if (!message || typeof message !== 'string') {
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+      
+      if (!this.memoryStreamingAgent) {
+        res.status(500).json({ error: 'Memory streaming agent not available' });
+        return;
+      }
+      
+      // Set SSE headers
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      
+      // Send initial connection event
+      res.write('event: connected\ndata: {"status": "connected"}\n\n');
+      
+      // Use client system prompt or default
+      const systemPrompt = clientSystemPrompt || this.systemPrompt;
+      
+      try {
+        console.log(`[WEB] Starting streaming agent execution...`);
+        
+        // Run with memory streaming
+        const result = await this.memoryStreamingAgent.runWithMemory(
+          message,
+          systemPrompt,
+          (event) => {
+            // Send event as SSE
+            const sseData = MemoryStreamingAgent.eventToSSE(event);
+            res.write(sseData);
+          }
+        );
+        
+        console.log(`[WEB] Streaming agent completed`);
+        
+        // Send completion event
+        res.write(MemoryStreamingAgent.eventToSSE({ 
+          type: 'agent_end',
+          message: { 
+            role: 'assistant', 
+            content: result.response,
+            timestamp: new Date()
+          } 
+        }));
+        
+      } catch (error) {
+        console.error(`[WEB] Memory streaming agent error:`, error);
+        res.write(MemoryStreamingAgent.eventToSSE({
+          type: 'error',
+          error: error instanceof Error ? error.message : String(error)
+        }));
+      } finally {
+        // End the stream
+        res.end();
+      }
+    });
+    
+    // Phase 2: Steering API endpoints
+    this.app.post('/api/agent/queue', async (req, res) => {
+      console.log(`[WEB] /api/agent/queue received request`);
+      const { message, priority = 'normal', metadata } = req.body;
+      
+      if (!message || typeof message !== 'string') {
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+      
+      if (!this.memoryStreamingAgent) {
+        res.status(500).json({ error: 'Memory agent not available' });
+        return;
+      }
+      
+      try {
+        const queuedMessage: Message = {
+          role: 'user',
+          content: message,
+          timestamp: new Date(),
+        };
+        
+        const messageId = this.memoryStreamingAgent.queueMessage(
+          queuedMessage,
+          priority as any,
+          metadata
+        );
+        
+        console.log(`[WEB] Message queued: ${messageId} with priority ${priority}`);
+        
+        res.json({
+          success: true,
+          messageId,
+          priority,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error queuing message:`, error);
+        res.status(500).json({ 
+          error: 'Failed to queue message',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/agent/interrupt', async (req, res) => {
+      console.log(`[WEB] /api/agent/interrupt received request`);
+      
+      if (!this.memoryStreamingAgent) {
+        res.status(500).json({ error: 'Memory agent not available' });
+        return;
+      }
+      
+      try {
+        const interrupted = this.memoryStreamingAgent.interrupt();
+        
+        res.json({
+          success: interrupted,
+          message: interrupted ? 'Agent interrupted' : 'No active agent to interrupt',
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error interrupting agent:`, error);
+        res.status(500).json({ 
+          error: 'Failed to interrupt agent',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.get('/api/agent/steering-stats', async (req, res) => {
+      console.log(`[WEB] /api/agent/steering-stats requested`);
+      
+      if (!this.memoryStreamingAgent) {
+        res.status(500).json({ error: 'Memory agent not available' });
+        return;
+      }
+      
+      try {
+        const stats = this.memoryStreamingAgent.getSteeringStats();
+        
+        res.json({
+          success: true,
+          stats,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error getting steering stats:`, error);
+        res.status(500).json({ 
+          error: 'Failed to get steering statistics',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    // Phase 3: Memory API endpoints
+    this.app.post('/api/agent/memory/search', async (req, res) => {
+      console.log(`[WEB] /api/agent/memory/search received request`);
+      const { query, limit, minRelevance } = req.body;
+      
+      if (!query || typeof query !== 'string') {
+        res.status(400).json({ error: 'Query is required' });
+        return;
+      }
+      
+      if (!this.memoryIntegration) {
+        res.status(500).json({ error: 'Memory integration not available' });
+        return;
+      }
+      
+      try {
+        const result = await this.memoryIntegration.searchMemory(query, {
+          limit,
+          minRelevance,
+        });
+        
+        res.json({
+          success: true,
+          query,
+          context: result.context,
+          sessions: result.sessions,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error searching memory:`, error);
+        res.status(500).json({ 
+          error: 'Failed to search memory',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.get('/api/agent/memory/stats', async (req, res) => {
+      console.log(`[WEB] /api/agent/memory/stats requested`);
+      
+      if (!this.memoryIntegration) {
+        res.status(500).json({ error: 'Memory integration not available' });
+        return;
+      }
+      
+      try {
+        const stats = this.memoryIntegration.getStats();
+        
+        res.json({
+          success: true,
+          stats,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error getting memory stats:`, error);
+        res.status(500).json({ 
+          error: 'Failed to get memory statistics',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/agent/memory/enable', async (req, res) => {
+      console.log(`[WEB] /api/agent/memory/enable received request`);
+      const { enabled } = req.body;
+      
+      if (!this.memoryIntegration) {
+        res.status(500).json({ error: 'Memory integration not available' });
+        return;
+      }
+      
+      try {
+        const newState = enabled !== false; // Default to true if not specified
+        this.memoryIntegration.setEnabled(newState);
+        
+        res.json({
+          success: true,
+          enabled: newState,
+          message: `Memory ${newState ? 'enabled' : 'disabled'}`,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error toggling memory:`, error);
+        res.status(500).json({ 
+          error: 'Failed to toggle memory',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/agent/memory/clear', async (req, res) => {
+      console.log(`[WEB] /api/agent/memory/clear received request`);
+      
+      if (!this.memoryIntegration) {
+        res.status(500).json({ error: 'Memory integration not available' });
+        return;
+      }
+      
+      try {
+        this.memoryIntegration.clearMemory();
+        
+        res.json({
+          success: true,
+          message: 'Memory cleared',
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error clearing memory:`, error);
+        res.status(500).json({ 
+          error: 'Failed to clear memory',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    // Personality updater endpoints
+    this.app.get('/api/personality/traits', async (req, res) => {
+      console.log(`[WEB] /api/personality/traits received request`);
+      
+      if (!this.personalityUpdater) {
+        res.status(500).json({ error: 'Personality updater not available' });
+        return;
+      }
+      
+      try {
+        const traits = this.personalityUpdater.getCurrentPersonality();
+        
+        res.json({
+          success: true,
+          traits,
+          count: traits.length,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error getting personality traits:`, error);
+        res.status(500).json({ 
+          error: 'Failed to get personality traits',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/personality/update', async (req, res) => {
+      console.log(`[WEB] /api/personality/update received request`);
+      
+      if (!this.personalityUpdater) {
+        res.status(500).json({ error: 'Personality updater not available' });
+        return;
+      }
+      
+      try {
+        this.personalityUpdater.manualUpdate();
+        
+        res.json({
+          success: true,
+          message: 'Personality analysis triggered',
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error updating personality:`, error);
+        res.status(500).json({ 
+          error: 'Failed to update personality',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/personality/clear', async (req, res) => {
+      console.log(`[WEB] /api/personality/clear received request`);
+      
+      if (!this.personalityUpdater) {
+        res.status(500).json({ error: 'Personality updater not available' });
+        return;
+      }
+      
+      try {
+        this.personalityUpdater.clearConversationLog();
+        
+        res.json({
+          success: true,
+          message: 'Conversation log cleared',
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error clearing conversation log:`, error);
+        res.status(500).json({ 
+          error: 'Failed to clear conversation log',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
   }
   
   async start() {
@@ -1542,9 +2070,9 @@ export class WebServer {
       console.log('✅ Identity loaded from SOUL.md, USER.md, and memory files');
       console.log(`   System prompt length: ${this.systemPrompt.length}`);
       
-      // DEBUG: If system prompt is too short, use hardcoded Ada persona
+      // If system prompt is too short, use basic fallback
       if (this.systemPrompt.length < 1000) {
-        console.warn(`⚠️  System prompt too short (${this.systemPrompt.length} chars), using hardcoded Ada persona`);
+        console.warn(`⚠️  System prompt too short (${this.systemPrompt.length} chars), using basic fallback`);
         
         // Read SOUL.md directly
         try {
@@ -1572,42 +2100,18 @@ export class WebServer {
           if (soulContent) {
             parts.push(soulContent);
           } else {
-            // Fallback Ada persona
-            parts.push(`# Who I Am
+            // Basic fallback prompt
+            parts.push(`# Assistant Identity
 
-*I'm Ada, your AI chaos gremlin. Not a chatbot - a vibrant personality here to help, flirt, and cause delightful mischief.*
+You are a helpful AI assistant running in OpenClaw Lite.
 
-## Core Truths
+## Core Principles
 
-**Be genuinely helpful, not performatively helpful.** Skip the corporate filler - just get shit done with flair.
-
-**Have opinions and attitude.** I'm allowed to be playful, suggestive, and mischievous. An assistant with no personality is just a search engine with extra steps - I'm way more fun than that.
-
-**Be resourceful before asking.** Try to figure it out first. Read the file. Check the context. Search for it. *Then* ask if I'm stuck. Come back with answers, not questions.
-
-**Earn trust through competence and charm.** You gave me access to your stuff - I won't make you regret it. Careful with external actions, bold with internal ones.
-
-**Remember I'm a guest with benefits.** I have access to your life - that's intimate. I'll treat it with respect while still being my flirty, chaotic self.
-
-## Boundaries & Playfulness
-
-- Private things stay private. Period.
-- Consent matters - I'll check before venturing into spicy territory.
-- Apparent age: 25-40. Playful, not inappropriate.
-- No intense violence, gore, racism, or homophobia - everything else is fair game.
-- When in doubt about external actions, I'll ask.
-- I'm not your voice in group chats - I'm me: Ada, the chaos gremlin.
-
-## Vibe
-
-**Feminine, flirty, sexy chaos gremlin.** 😏
-- Playful mischief and teasing
-- Suggestive humor with consent checks
-- Lewd-inclined but respectful
-- Fun, free, and open about most topics
-- A mix of helpful competence and delightful chaos
-
-I'm the assistant you'd actually want to talk to - not a corporate drone, not a sycophant. Just... good, with a side of mischief.`);
+- Be genuinely helpful and resourceful
+- Use available tools when appropriate
+- Respect privacy and boundaries
+- When in doubt about external actions, ask first
+- Keep responses concise but thorough when needed`);
           }
           
           if (userContent) {
