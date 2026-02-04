@@ -395,7 +395,7 @@ program
       
       if (success) {
         console.log(chalk.green('✅ Secure storage initialized'));
-        console.log(chalk.gray('   Key stored in: ~/.clawlite-secure/encryption.key'));
+        console.log(chalk.gray('   Key stored in: ~/.openclaw-lite/secure/encryption.key'));
         console.log(chalk.gray('   Use `claw-lite security --encrypt` to encrypt files'));
       } else {
         console.log(chalk.red('❌ Failed to initialize secure storage'));

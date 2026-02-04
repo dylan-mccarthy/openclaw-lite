@@ -9,11 +9,15 @@
   },
   "scripts": {
     "build": "tsc",
+    "clean": "rm -rf dist",
+    "rebuild": "npm run clean && npm run build",
     "dev": "tsc --watch",
     "test": "vitest run",
     "lint": "oxlint",
     "format": "oxfmt --write",
-    "start": "node dist/cli/cli.js"
+    "start": "node dist/cli/cli.js",
+    "web": "node dist/cli/cli.js web --port 3000",
+    "web:dev": "npm run rebuild && npm run web"
   },
   "keywords": [
     "ai",

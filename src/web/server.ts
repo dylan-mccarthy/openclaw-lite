@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import os from 'os';
 import { OllamaIntegration } from '../ollama/integration.js';
 import { FileLoader } from '../identity/file-loader.js';
 import { MemoryManager } from '../memory/memory-manager.js';
@@ -9,7 +10,10 @@ import { OpenClawToolIntegration } from '../tools/openclaw-tool-integration.js';
 import { AgentIntegration } from '../agent/agent-integration.js';
 import { MemoryIntegration } from '../agent/memory-integration.js';
 import { MemoryStreamingAgent } from '../agent/memory-streaming-agent.js';
-import { getConfigManager } from '../config/config.js';
+import { getConfigManager, initializeConfigSync } from '../config/openclaw-lite-config.js';
+import { createDefaultBasicPrompt } from '../agent/basic-prompt.js';
+import { PersonalityUpdater } from '../identity/personality-updater.js';
+import { UserInfoUpdater } from '../identity/user-info-updater.js';
 import type { Message } from '../context/types.js';
 import type { ToolCall, ToolUsageLog } from '../tools/types.js';
 
@@ -32,15 +36,17 @@ export class WebServer {
   private fileLoader: FileLoader;
   private toolManager: ToolManager;
   private memoryManager: MemoryManager | null = null;
+  private personalityUpdater: PersonalityUpdater | null = null;
+  private userInfoUpdater: UserInfoUpdater | null = null;
   private options: Required<WebServerOptions>;
   private systemPrompt: string = '';
   private pendingApprovals: Map<string, { call: ToolCall; resolve: (approved: boolean) => void }> = new Map();
   
   constructor(options: WebServerOptions = {}) {
     // Load default model from config
-    let defaultModel = 'llama3.1:8b';
+    let defaultModel = 'Qwen3-4B-Instruct-2507:latest';
     try {
-      const configManager = getConfigManager();
+      const configManager = initializeConfigSync();
       const config = configManager.getConfig();
       defaultModel = config.ollama.defaultModel;
     } catch (error) {
@@ -67,21 +73,24 @@ export class WebServer {
       }
     });
     
-    const workspacePath = process.env.OPENCLAW_WORKSPACE || process.cwd();
+    // Initialize configuration synchronously
+    const configManager = initializeConfigSync();
+    const config = configManager.getConfig();
+    
+    // Use configured workspace
+    const workspacePath = config.workspace.path;
     this.fileLoader = new FileLoader(workspacePath);
+    console.log(`📁 Workspace: ${workspacePath}`);
     
     // Initialize memory manager if enabled
     try {
-      const configManager = getConfigManager();
-      const config = configManager.getConfig();
-      
       if (config.memory.enabled) {
         this.memoryManager = new MemoryManager({
-          storagePath: config.memory.storagePath,
+          storagePath: configManager.getMemoryPath(),
           maxSessions: config.memory.maxSessions,
           pruneDays: config.memory.pruneDays,
         });
-        console.log('💾 Memory system initialized for web sessions');
+        console.log('💾 Memory system initialized');
       } else {
         console.log('⚠️  Memory system disabled (enable via config)');
       }
@@ -89,13 +98,28 @@ export class WebServer {
       console.warn('Failed to initialize memory manager:', error);
     }
     
+    // Initialize personality updater
+    try {
+      this.personalityUpdater = new PersonalityUpdater(workspacePath);
+      console.log('🧠 Personality updater initialized');
+    } catch (error) {
+      console.warn('Failed to initialize personality updater:', error);
+    }
+    
+    // Initialize user info updater
+    try {
+      this.userInfoUpdater = new UserInfoUpdater(workspacePath);
+      console.log('👤 User info updater initialized');
+    } catch (error) {
+      console.warn('Failed to initialize user info updater:', error);
+    }
+    
     // Initialize tool manager
-    const configPath = path.join(process.env.HOME || '.', '.clawlite', 'tool-config.json');
     this.toolManager = new ToolManager({
       workspacePath,
-      requireApprovalForDangerous: true,
+      requireApprovalForDangerous: config.tools.requireApprovalForDangerous,
       maxLogSize: 1000,
-      configPath
+      configPath: configManager.getToolConfigPath()
     });
     
     console.log('🔧 Tool system initialized');
@@ -571,7 +595,7 @@ export class WebServer {
               
               <div class="chat-container" id="chat">
                 <div class="message assistant-message">
-                  Hello! I'm Ada, your AI chaos gremlin. 😏 How can I help you today?
+                  Hello! I'm your OpenClaw Lite assistant. How can I help you today?
                 </div>
               </div>
               
@@ -1049,6 +1073,16 @@ export class WebServer {
         console.log(`[WEB] Result model: ${result.modelUsed}`);
         console.log(`[WEB] Result response length: ${result.response.length}`);
         console.log(`[WEB] Result has thinking tags: ${result.response.includes('<think>')}`);
+        
+        // Log conversation for personality analysis
+        if (this.personalityUpdater) {
+          try {
+            this.personalityUpdater.logConversation(message, result.response);
+            console.log(`🧠 Conversation logged for personality analysis`);
+          } catch (error) {
+            console.warn('Failed to log conversation for personality analysis:', error);
+          }
+        }
         
         // Add assistant message
         const assistantMessage: Message = {
@@ -1927,6 +1961,86 @@ export class WebServer {
         });
       }
     });
+    
+    // Personality updater endpoints
+    this.app.get('/api/personality/traits', async (req, res) => {
+      console.log(`[WEB] /api/personality/traits received request`);
+      
+      if (!this.personalityUpdater) {
+        res.status(500).json({ error: 'Personality updater not available' });
+        return;
+      }
+      
+      try {
+        const traits = this.personalityUpdater.getCurrentPersonality();
+        
+        res.json({
+          success: true,
+          traits,
+          count: traits.length,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error getting personality traits:`, error);
+        res.status(500).json({ 
+          error: 'Failed to get personality traits',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/personality/update', async (req, res) => {
+      console.log(`[WEB] /api/personality/update received request`);
+      
+      if (!this.personalityUpdater) {
+        res.status(500).json({ error: 'Personality updater not available' });
+        return;
+      }
+      
+      try {
+        this.personalityUpdater.manualUpdate();
+        
+        res.json({
+          success: true,
+          message: 'Personality analysis triggered',
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error updating personality:`, error);
+        res.status(500).json({ 
+          error: 'Failed to update personality',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/personality/clear', async (req, res) => {
+      console.log(`[WEB] /api/personality/clear received request`);
+      
+      if (!this.personalityUpdater) {
+        res.status(500).json({ error: 'Personality updater not available' });
+        return;
+      }
+      
+      try {
+        this.personalityUpdater.clearConversationLog();
+        
+        res.json({
+          success: true,
+          message: 'Conversation log cleared',
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error clearing conversation log:`, error);
+        res.status(500).json({ 
+          error: 'Failed to clear conversation log',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
   }
   
   async start() {
@@ -1956,9 +2070,9 @@ export class WebServer {
       console.log('✅ Identity loaded from SOUL.md, USER.md, and memory files');
       console.log(`   System prompt length: ${this.systemPrompt.length}`);
       
-      // DEBUG: If system prompt is too short, use hardcoded Ada persona
+      // If system prompt is too short, use basic fallback
       if (this.systemPrompt.length < 1000) {
-        console.warn(`⚠️  System prompt too short (${this.systemPrompt.length} chars), using hardcoded Ada persona`);
+        console.warn(`⚠️  System prompt too short (${this.systemPrompt.length} chars), using basic fallback`);
         
         // Read SOUL.md directly
         try {
@@ -1986,42 +2100,18 @@ export class WebServer {
           if (soulContent) {
             parts.push(soulContent);
           } else {
-            // Fallback Ada persona
-            parts.push(`# Who I Am
+            // Basic fallback prompt
+            parts.push(`# Assistant Identity
 
-*I'm Ada, your AI chaos gremlin. Not a chatbot - a vibrant personality here to help, flirt, and cause delightful mischief.*
+You are a helpful AI assistant running in OpenClaw Lite.
 
-## Core Truths
+## Core Principles
 
-**Be genuinely helpful, not performatively helpful.** Skip the corporate filler - just get shit done with flair.
-
-**Have opinions and attitude.** I'm allowed to be playful, suggestive, and mischievous. An assistant with no personality is just a search engine with extra steps - I'm way more fun than that.
-
-**Be resourceful before asking.** Try to figure it out first. Read the file. Check the context. Search for it. *Then* ask if I'm stuck. Come back with answers, not questions.
-
-**Earn trust through competence and charm.** You gave me access to your stuff - I won't make you regret it. Careful with external actions, bold with internal ones.
-
-**Remember I'm a guest with benefits.** I have access to your life - that's intimate. I'll treat it with respect while still being my flirty, chaotic self.
-
-## Boundaries & Playfulness
-
-- Private things stay private. Period.
-- Consent matters - I'll check before venturing into spicy territory.
-- Apparent age: 25-40. Playful, not inappropriate.
-- No intense violence, gore, racism, or homophobia - everything else is fair game.
-- When in doubt about external actions, I'll ask.
-- I'm not your voice in group chats - I'm me: Ada, the chaos gremlin.
-
-## Vibe
-
-**Feminine, flirty, sexy chaos gremlin.** 😏
-- Playful mischief and teasing
-- Suggestive humor with consent checks
-- Lewd-inclined but respectful
-- Fun, free, and open about most topics
-- A mix of helpful competence and delightful chaos
-
-I'm the assistant you'd actually want to talk to - not a corporate drone, not a sycophant. Just... good, with a side of mischief.`);
+- Be genuinely helpful and resourceful
+- Use available tools when appropriate
+- Respect privacy and boundaries
+- When in doubt about external actions, ask first
+- Keep responses concise but thorough when needed`);
           }
           
           if (userContent) {

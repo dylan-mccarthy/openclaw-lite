@@ -73,7 +73,7 @@ export class CredentialManager {
   private masterKey: Buffer;
   
   constructor(
-    secureStoragePath: string = join(process.env.HOME || '', '.clawlite-secure'),
+    secureStoragePath: string = join(process.env.HOME || '', '.openclaw-lite', 'secure'),
     masterKey?: string
   ) {
     this.vaultPath = join(secureStoragePath, 'credentials');
