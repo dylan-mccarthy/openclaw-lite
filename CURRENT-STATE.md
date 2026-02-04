@@ -22,8 +22,8 @@
 ### ✅ **Configuration**
 - **Central Config** - `~/.openclaw-lite/openclaw-lite.json`
 - **Workspace** - Dedicated `~/.openclaw-lite` directory
-- **Identity Files** - SOUL.md, USER.md, AGENTS.md in identity/
-- **Tool Config** - Auto-approved tools in config/
+- **Identity Files** - SOUL.md, USER.md, AGENTS.md in workspace/
+- **Tool Config** - Tool config stored in config/ (approvals disabled by default)
 
 ## 🔍 Current Findings
 
@@ -50,8 +50,8 @@ The bot is **naturally developing a personality similar to "Ada"** even though w
 
 ### **Tools:**
 - **Total:** 18 tools available
-- **Auto-approval:** Enabled for all tools
-- **Dangerous tools:** Marked but auto-approved for development
+- **Auto-approval:** Enabled by default for development (`tools.disableApprovals=true`)
+- **Dangerous tools:** Enforced only when approvals are enabled
 
 ### **Personality:**
 - **Traits detected:** playful, concise, technical, humorous, helpful
@@ -112,7 +112,7 @@ The bot is **naturally developing a personality similar to "Ada"** even though w
 
 ### **Tool System:**
 - ✅ 18 tools available
-- ✅ Auto-approval working
+- ✅ Auto-approval in dev (configurable)
 - ✅ Workspace sandboxing
 - ✅ Activity logging
 
@@ -135,6 +135,6 @@ The bot is **naturally developing a personality similar to "Ada"** even though w
 
 ---
 
-**OpenClaw Lite is ready for use and personality development!** 🚀
+**OpenClaw Lite is ready for development and iteration.** 🚀
 
-The bot will naturally evolve its personality through conversation, starting from a clean slate and developing based on your interactions.
+Security note: dev mode disables approvals by default. Enable approvals for production use.

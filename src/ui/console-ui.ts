@@ -2,6 +2,7 @@ import readline from 'readline/promises';
 import chalk from 'chalk';
 import { OllamaIntegration } from '../ollama/integration.js';
 import { FileLoader } from '../identity/file-loader.js';
+import { initializeConfigSync } from '../config/openclaw-lite-config.js';
 import type { Message } from '../context/types.js';
 
 export interface ConsoleUIOptions {
@@ -53,7 +54,23 @@ export class ConsoleUI {
       }
     });
     
-    this.fileLoader = new FileLoader(process.env.OPENCLAW_WORKSPACE || process.cwd());
+    let workspacePath = process.env.OPENCLAW_WORKSPACE || process.cwd();
+    let identityPath: string | undefined;
+    let memoryPath: string | undefined;
+    try {
+      const configManager = initializeConfigSync();
+      workspacePath = configManager.getWorkspacePath();
+      identityPath = configManager.getIdentityPath();
+      memoryPath = configManager.getMemoryPath();
+    } catch (error) {
+      console.warn('Could not load config, using environment workspace path:', error);
+    }
+
+    this.fileLoader = new FileLoader({
+      workspacePath,
+      identityPath,
+      memoryPath
+    });
     
     // this.contextManager = new ContextManager({
     //   maxContextTokens: this.options.maxContextTokens

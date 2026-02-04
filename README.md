@@ -1,6 +1,6 @@
 # OpenClaw Lite
 
-A minimal, focused version of OpenClaw designed for **local LLMs** with enhanced context management and security.
+A minimal, focused version of OpenClaw designed for **local LLMs** with strong context management, a lightweight agent loop, and security‑first defaults.
 
 ## 🎯 Goals
 
@@ -74,6 +74,12 @@ claw-lite tokens "Code example: function test() { return 42; }" --model ollama/q
 claw-lite test
 ```
 
+### Web UI
+```bash
+# Start the web server
+claw-lite web --port 3000
+```
+
 ## 🧠 Core Components
 
 ### Context Manager
@@ -93,6 +99,16 @@ claw-lite test
 - **Accurate estimates** for better context management
 - **Code‑aware** estimation for programming tasks
 
+### Agent Loop
+- **Multi‑turn tool execution** with streaming support
+- **Tool bridge** for safe, structured tool calls
+- **Memory integration** for context recall
+
+### Web Server
+- **Chat UI + API** at http://localhost:3000
+- **Tool activity feed** and configuration panel
+- **Streaming agent endpoint** for long‑running tasks
+
 ## 📁 Project Structure
 
 ```
@@ -103,8 +119,13 @@ openclaw-lite/
 │   │   ├── token-estimator.ts
 │   │   ├── context-manager.ts
 │   │   └── model-router.ts
+│   ├── agent/             # Agent loop + streaming
 │   ├── cli/              # Command-line interface
 │   │   └── cli.ts        # Main CLI (distinct from 'openclaw')
+│   ├── web/              # Web server + UI
+│   ├── tools/            # Tooling + approvals
+│   ├── security/         # Encryption + skill verification
+│   ├── memory/           # Session storage
 │   └── index.ts          # Library entry point
 ├── test/                 # Comprehensive tests
 ├── dist/                 # Compiled output
@@ -145,8 +166,8 @@ console.log(`Using model: ${model.modelId}`); // e.g., "ollama/qwen3:latest"
 ## 🎨 Design Philosophy
 
 ### 1. **Do Less, Better**
-- Remove unnecessary channels (keep only Telegram)
-- Simplify skill system
+- Keep the core loop: local LLM + tools + memory
+- Simplify skills and external integrations
 - Focus on local LLM optimization
 
 ### 2. **Context‑First**
@@ -156,8 +177,8 @@ console.log(`Using model: ${model.modelId}`); // e.g., "ollama/qwen3:latest"
 
 ### 3. **Security by Design**
 - File encryption for sensitive data
-- Skill sandboxing
-- Audit trails for all actions
+- Skill verification (prompt‑injection scanning)
+- Secure storage separation
 
 ### 4. **Debuggability**
 - Structured action logging
@@ -174,16 +195,17 @@ console.log(`Using model: ${model.modelId}`); // e.g., "ollama/qwen3:latest"
 
 ## 🚧 Roadmap
 
-### Phase 1 (Current) - Core Context Management ✅
+### Phase 1 (Current) - Core Context + Agent ✅
 - [x] Context Manager with adaptive compression
 - [x] Model Router for smart model selection
 - [x] Token Estimator for accurate counting
-- [x] Minimal CLI tool (`claw-lite`)
+- [x] Agent loop + tool bridge
+- [x] Web server + streaming agent endpoint
 
 ### Phase 2 - Security Layer
-- [ ] File encryption for SOUL.md/USER.md
+- [x] File encryption for SOUL.md/USER.md
+- [x] Secure workspace isolation
 - [ ] Skill permission system
-- [ ] Secure workspace isolation
 
 ### Phase 3 - Audit System
 - [ ] Structured action logging
@@ -203,6 +225,13 @@ This is a **separate tool** from your main OpenClaw installation. It uses:
 - **Isolated workspace**
 
 No risk of accidentally modifying your running OpenClaw environment.
+
+## 🛡️ Security Mode
+
+OpenClaw Lite supports two modes:
+
+- **Development (default):** tool approvals disabled for faster iteration.
+- **Production:** enable approvals by setting `tools.disableApprovals=false` in config.
 
 ## 🤝 Contributing
 

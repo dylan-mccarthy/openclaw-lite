@@ -8,7 +8,7 @@ import { ContextManager } from '../context/context-manager.js';
 import { ModelRouter } from '../context/model-router.js';
 import { TokenEstimator } from '../context/token-estimator.js';
 import { OllamaIntegration } from '../ollama/integration.js';
-import { getConfigManager } from '../config/config.js';
+import { initializeConfig } from '../config/openclaw-lite-config.js';
 import { join, basename } from 'path';
 import type { Message } from '../context/types.js';
 
@@ -178,20 +178,27 @@ program
 program
   .command('ollama')
   .description('Interact with Ollama local LLM')
-  .option('-u, --url <url>', 'Ollama API URL', 'http://localhost:11434')
-  .option('-m, --model <name>', 'Model to use', 'llama3.1:8b')
-  .option('-t, --temperature <number>', 'Temperature (0-1)', '0.7')
-  .option('--max-tokens <number>', 'Maximum tokens to generate', '2048')
+  .option('-u, --url <url>', 'Ollama API URL')
+  .option('-m, --model <name>', 'Model to use')
+  .option('-t, --temperature <number>', 'Temperature (0-1)')
+  .option('--max-tokens <number>', 'Maximum tokens to generate')
   .action(async (options) => {
     const spinner = ora('Connecting to Ollama...').start();
     
     try {
+      const configManager = await initializeConfig();
+      const config = configManager.getConfig();
+      const url = options.url || config.ollama.url;
+      const model = options.model || config.ollama.defaultModel;
+      const temperature = options.temperature ? parseFloat(options.temperature) : config.ollama.temperature;
+      const maxTokens = options.maxTokens ? parseInt(options.maxTokens) : config.ollama.maxTokens;
+
       const integration = new OllamaIntegration({
         ollama: {
-          baseUrl: options.url,
-          model: options.model,
-          temperature: parseFloat(options.temperature),
-          maxTokens: parseInt(options.maxTokens),
+          baseUrl: url,
+          model,
+          temperature,
+          maxTokens,
         },
       });
       
@@ -210,16 +217,16 @@ program
       
       console.log('\n' + chalk.bold('🤖 Ollama Status:'));
       console.log(chalk.gray('─'.repeat(50)));
-      console.log(`URL: ${chalk.cyan(options.url)}`);
-      console.log(`Default model: ${chalk.green(options.model)}`);
+      console.log(`URL: ${chalk.cyan(url)}`);
+      console.log(`Default model: ${chalk.green(model)}`);
       console.log(`Available models: ${chalk.yellow(health.models.length)}`);
       
       if (health.models.length > 0) {
         console.log(chalk.gray('\nInstalled models:'));
-        health.models.forEach(model => {
-          const isDefault = model === options.model;
+        health.models.forEach(modelName => {
+          const isDefault = modelName === model;
           const prefix = isDefault ? chalk.green('→ ') : '  ';
-          console.log(`${prefix}${model}`);
+          console.log(`${prefix}${modelName}`);
         });
       }
       
@@ -238,19 +245,25 @@ program
   .command('ask')
   .description('Ask Ollama a question')
   .argument('<question>', 'Question to ask')
-  .option('-u, --url <url>', 'Ollama API URL', 'http://localhost:11434')
-  .option('-m, --model <name>', 'Model to use', 'llama3.1:8b')
+  .option('-u, --url <url>', 'Ollama API URL')
+  .option('-m, --model <name>', 'Model to use')
   .option('-s, --system <prompt>', 'System prompt')
-  .option('--max-tokens <number>', 'Maximum response tokens', '1024')
+  .option('--max-tokens <number>', 'Maximum response tokens')
   .action(async (question, options) => {
     const spinner = ora('Thinking...').start();
     
     try {
+      const configManager = await initializeConfig();
+      const config = configManager.getConfig();
+      const url = options.url || config.ollama.url;
+      const model = options.model || config.ollama.defaultModel;
+      const maxTokens = options.maxTokens ? parseInt(options.maxTokens) : Math.min(1024, config.ollama.maxTokens);
+
       const integration = new OllamaIntegration({
         ollama: {
-          baseUrl: options.url,
-          model: options.model,
-          maxTokens: parseInt(options.maxTokens),
+          baseUrl: url,
+          model,
+          maxTokens,
         },
       });
       
@@ -274,7 +287,7 @@ program
       console.log(chalk.green(result));
       
       console.log(chalk.gray('\n─'.repeat(50)));
-      console.log(`Model: ${chalk.cyan(options.model)}`);
+      console.log(`Model: ${chalk.cyan(model)}`);
       console.log(`System: ${chalk.magenta(systemPrompt.substring(0, 60) + (systemPrompt.length > 60 ? '...' : ''))}`);
       
     } catch (error) {
@@ -287,21 +300,27 @@ program
 program
   .command('chat')
   .description('Interactive chat with Ollama')
-  .option('-u, --url <url>', 'Ollama API URL', 'http://localhost:11434')
-  .option('-m, --model <name>', 'Model to use', 'llama3.1:8b')
+  .option('-u, --url <url>', 'Ollama API URL')
+  .option('-m, --model <name>', 'Model to use')
   .option('-s, --system <prompt>', 'System prompt')
-  .option('--max-context <tokens>', 'Maximum context tokens', '4096')
+  .option('--max-context <tokens>', 'Maximum context tokens')
   .option('--save', 'Save session to persistent memory')
   .option('--session-id <id>', 'Load existing session from memory')
   .action(async (options) => {
     try {
+      const configManager = await initializeConfig();
+      const config = configManager.getConfig();
+      const url = options.url || config.ollama.url;
+      const model = options.model || config.ollama.defaultModel;
+      const maxContextTokens = options.maxContext ? parseInt(options.maxContext) : config.web.maxContextTokens;
+
       const { startInteractiveChat } = await import('./chat-memory.js');
       
       await startInteractiveChat({
-        url: options.url,
-        model: options.model,
+        url,
+        model,
         systemPrompt: options.system,
-        maxContextTokens: parseInt(options.maxContext),
+        maxContextTokens,
         saveSession: options.save,
         sessionId: options.sessionId,
       });
@@ -316,9 +335,9 @@ program
 program
   .command('ui')
   .description('Start console UI (chat + logs focused)')
-  .option('-u, --url <url>', 'Ollama API URL', 'http://localhost:11434')
-  .option('-m, --model <name>', 'Model to use', 'llama3.1:8b')
-  .option('-c, --context <tokens>', 'Max context tokens', '8192')
+  .option('-u, --url <url>', 'Ollama API URL')
+  .option('-m, --model <name>', 'Model to use')
+  .option('-c, --context <tokens>', 'Max context tokens')
   .option('-l, --log <file>', 'Log conversation to file')
   .option('--no-stats', 'Hide token statistics')
   .option('--prompt <text>', 'System prompt for the AI')
@@ -326,12 +345,18 @@ program
     console.log(chalk.gray('Starting OpenClaw Lite Console UI...\n'));
     
     try {
+      const configManager = await initializeConfig();
+      const config = configManager.getConfig();
+      const url = options.url || config.ollama.url;
+      const model = options.model || config.ollama.defaultModel;
+      const maxContextTokens = options.context ? parseInt(options.context) : config.web.maxContextTokens;
+
       const { startConsoleUI } = await import('../ui/console-ui.js');
       
       await startConsoleUI({
-        ollamaUrl: options.url,
-        model: options.model,
-        maxContextTokens: parseInt(options.context),
+        ollamaUrl: url,
+        model,
+        maxContextTokens,
         showTokens: options.stats,
         logFile: options.log,
         systemPrompt: options.prompt
@@ -347,24 +372,33 @@ program
 program
   .command('web')
   .description('Start web server with chat interface')
-  .option('-p, --port <port>', 'Port to listen on', '3000')
-  .option('-u, --url <url>', 'Ollama API URL', 'http://localhost:11434')
-  .option('-m, --model <name>', 'Model to use', 'llama3.1:8b')
-  .option('-c, --context <tokens>', 'Max context tokens', '8192')
+  .option('-p, --port <port>', 'Port to listen on')
+  .option('-u, --url <url>', 'Ollama API URL')
+  .option('-m, --model <name>', 'Model to use')
+  .option('-c, --context <tokens>', 'Max context tokens')
   .option('--no-cors', 'Disable CORS')
   .option('--prompt <text>', 'System prompt for the AI')
   .action(async (options) => {
     console.log(chalk.gray('Starting OpenClaw Lite Web Server...\n'));
     
     try {
+      const configManager = await initializeConfig();
+      const config = configManager.getConfig();
+      const url = options.url || config.ollama.url;
+      const model = options.model || config.ollama.defaultModel;
+      const port = options.port ? parseInt(options.port) : config.web.port;
+      const maxContextTokens = options.context ? parseInt(options.context) : config.web.maxContextTokens;
+      const corsFlag = process.argv.includes('--no-cors') ? false : undefined;
+      const enableCors = corsFlag ?? config.web.enableCors;
+
       const { startWebServer } = await import('../web/server.js');
       
       await startWebServer({
-        port: parseInt(options.port),
-        ollamaUrl: options.url,
-        model: options.model,
-        maxContextTokens: parseInt(options.context),
-        enableCors: !options.noCors,
+        port,
+        ollamaUrl: url,
+        model,
+        maxContextTokens,
+        enableCors,
         systemPrompt: options.prompt
       });
       
@@ -383,9 +417,16 @@ program
   .option('-s, --status', 'Show encryption status of sensitive files')
   .option('-i, --init', 'Initialize secure storage with new encryption key')
   .action(async (options) => {
-    const workspace = process.env.OPENCLAW_WORKSPACE || process.cwd();
+    const configManager = await initializeConfig();
+    const workspace = configManager.getWorkspacePath();
+    const identityPath = configManager.getIdentityPath();
+    const memoryPath = configManager.getMemoryPath();
     const { FileLoader } = await import('../identity/file-loader.js');
-    const fileLoader = new FileLoader(workspace);
+    const fileLoader = new FileLoader({
+      workspacePath: workspace,
+      identityPath,
+      memoryPath
+    });
     
     if (options.init) {
       console.log(chalk.gray('🔐 Initializing secure storage...'));
@@ -457,11 +498,12 @@ program
   .option('-u, --update <key=value>', 'Update configuration (e.g., "ollama.defaultModel=huihui_ai/qwen3-abliterated")')
   .option('-r, --reset', 'Reset to default configuration')
   .action(async (options) => {
-    const configManager = getConfigManager();
+    const configManager = await initializeConfig();
     const config = configManager.getConfig();
     
     if (options.reset) {
-      configManager.updateConfig({});
+      configManager.resetToDefaults();
+      await configManager.save();
       console.log(chalk.green('✅ Configuration reset to defaults'));
       console.log(chalk.gray('\nRun `claw-lite config --show` to see the new configuration'));
       return;
@@ -495,6 +537,7 @@ program
       
       current[keys[keys.length - 1]] = parsedValue;
       configManager.updateConfig(config);
+      await configManager.save();
       
       console.log(chalk.green(`✅ Updated ${path} = ${JSON.stringify(parsedValue)}`));
       return;
@@ -504,7 +547,7 @@ program
       console.log(chalk.bold('📋 OpenClaw Lite Configuration'));
       console.log(chalk.gray('─'.repeat(60)));
       console.log(JSON.stringify(config, null, 2));
-      console.log(chalk.gray('\nConfig file:'), configManager.getConfig().memory.storagePath.replace('/memory', '/config.json'));
+      console.log(chalk.gray('\nConfig file:'), configManager.getConfigFilePath());
       return;
     }
   });
@@ -519,7 +562,7 @@ program
   .option('-e, --export <path>', 'Export all sessions to JSON file')
   .option('-i, --import <path>', 'Import sessions from JSON file')
   .action(async (options) => {
-    const configManager = getConfigManager();
+    const configManager = await initializeConfig();
     const config = configManager.getConfig();
     
     if (!config.memory.enabled) {
@@ -530,7 +573,7 @@ program
     
     const { MemoryManager } = await import('../memory/memory-manager.js');
     const memoryManager = new MemoryManager({
-      storagePath: config.memory.storagePath,
+      storagePath: configManager.getMemoryPath(),
       maxSessions: config.memory.maxSessions,
       pruneDays: config.memory.pruneDays,
     });
@@ -632,7 +675,8 @@ program
   .option('-u, --uninstall <name>', 'Uninstall a skill')
   .option('-s, --scan <path>', 'Scan a skill directory for safety issues')
   .action(async (options) => {
-    const workspace = process.env.OPENCLAW_WORKSPACE || process.cwd();
+    const configManager = await initializeConfig();
+    const workspace = configManager.getWorkspacePath();
     const skillsPath = join(workspace, 'skills');
     const credentialManager = await getCredentialManager();
     

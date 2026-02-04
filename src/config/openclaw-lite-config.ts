@@ -21,6 +21,7 @@ export const OpenClawLiteConfigSchema = z.object({
     configPath: z.string().default('config/tool-config.json'),
     requireApprovalForDangerous: z.boolean().default(false),
     defaultDangerousTools: z.array(z.string()).default([]),
+    disableApprovals: z.boolean().default(true),
   }),
   
   // Ollama configuration
@@ -128,11 +129,26 @@ export class OpenClawLiteConfigManager {
   getConfig(): OpenClawLiteConfig {
     return this.config;
   }
+
+  getConfigFilePath(): string {
+    return this.configPath;
+  }
   
   updateConfig(updates: Partial<OpenClawLiteConfig>): void {
     this.config = OpenClawLiteConfigSchema.parse({
       ...this.config,
       ...updates,
+    });
+  }
+
+  resetToDefaults(): void {
+    this.config = OpenClawLiteConfigSchema.parse({
+      workspace: {},
+      tools: {},
+      ollama: {},
+      memory: {},
+      web: {},
+      agent: {},
     });
   }
   

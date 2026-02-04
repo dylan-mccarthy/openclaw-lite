@@ -11,14 +11,36 @@ export interface Identity {
   recentMemory?: string[];
 }
 
+export interface FileLoaderOptions {
+  workspacePath?: string;
+  identityPath?: string;
+  memoryPath?: string;
+}
+
 export class FileLoader {
   private workspacePath: string;
+  private identityPath: string;
+  private memoryPath: string;
+  private identityRelativePath: string | null;
   private securityManager: FileSecurityManager | null = null;
   private keyManager: SecureKeyManager;
   private encryptionEnabled: boolean = false;
   
-  constructor(workspacePath: string = process.cwd()) {
+  constructor(options: string | FileLoaderOptions = process.cwd()) {
+    const workspacePath = typeof options === 'string'
+      ? options
+      : options.workspacePath || process.cwd();
+    const identityPath = typeof options === 'string'
+      ? workspacePath
+      : options.identityPath || workspacePath;
+    const memoryPath = typeof options === 'string'
+      ? path.join(workspacePath, 'memory')
+      : options.memoryPath || path.join(workspacePath, 'memory');
+
     this.workspacePath = workspacePath;
+    this.identityPath = identityPath;
+    this.memoryPath = memoryPath;
+    this.identityRelativePath = this.getRelativePath(identityPath);
     this.keyManager = new SecureKeyManager();
     
     // Check if we have encryption available
@@ -42,32 +64,42 @@ export class FileLoader {
   async ensureEncryptedFiles(): Promise<void> {
     if (this.securityManager) {
       // Check and encrypt sensitive files
-      const sensitiveFiles = [
+      const identityFiles = [
         'SOUL.md',
         'USER.md',
         'IDENTITY.md',
-        'MEMORY.md',
         'AGENTS.md',
         'TOOLS.md',
         'HEARTBEAT.md'
       ];
       
-      for (const file of sensitiveFiles) {
-        const filePath = path.join(this.workspacePath, file);
+      for (const file of identityFiles) {
+        const filePath = path.join(this.identityPath, file);
         if (fs.existsSync(filePath)) {
-          this.securityManager.ensureEncrypted(file);
+          const relative = this.toSecureRelativePath(this.identityRelativePath, file);
+          if (relative) {
+            this.securityManager.ensureEncrypted(relative);
+          }
         }
+      }
+
+      const memoryFilePath = path.join(this.workspacePath, 'MEMORY.md');
+      if (fs.existsSync(memoryFilePath)) {
+        this.securityManager.ensureEncrypted('MEMORY.md');
       }
       
       // Check memory directory
-      const memoryDir = path.join(this.workspacePath, 'memory');
+      const memoryDir = this.memoryPath;
       if (fs.existsSync(memoryDir)) {
         const files = fs.readdirSync(memoryDir)
           .filter(file => file.endsWith('.md') && file.match(/^\d{4}-\d{2}-\d{2}\.md$/));
         
         for (const file of files) {
-          const relativePath = path.join('memory', file).replace(/\\/g, '/');
-          this.securityManager.ensureEncrypted(relativePath);
+          const memoryFile = path.join(memoryDir, file);
+          const relativePath = this.getRelativePath(memoryFile);
+          if (relativePath) {
+            this.securityManager.ensureEncrypted(relativePath);
+          }
         }
       }
     }
@@ -77,6 +109,9 @@ export class FileLoader {
     const identity: Identity = {};
     
     try {
+      if (this.securityManager) {
+        await this.ensureEncryptedFiles();
+      }
       // 1. Load SOUL.md (who you are)
       identity.soul = await this.readFileIfExists('SOUL.md');
       
@@ -100,6 +135,9 @@ export class FileLoader {
   }
   
   async constructSystemPrompt(): Promise<string> {
+    if (this.securityManager) {
+      await this.ensureEncryptedFiles();
+    }
     const identity = await this.loadIdentity();
     const parts: string[] = [];
     
@@ -138,18 +176,23 @@ export class FileLoader {
 - When in doubt about external actions, ask first
 - Use available tools when appropriate
 - Keep responses concise but thorough when needed
+  - You can access workspace files via tools (use the read tool when asked)
+  - Never claim you cannot access local files when a tool can read them
 `);
     
     return parts.join('\n');
   }
   
   private async readFileIfExists(filename: string): Promise<string | undefined> {
-    const filePath = path.join(this.workspacePath, filename);
+    const filePath = path.join(this.identityPath, filename);
     
     if (fs.existsSync(filePath)) {
       try {
         if (this.securityManager) {
-          return this.securityManager.readSecureFile(filename);
+          const relative = this.toSecureRelativePath(this.identityRelativePath, filename);
+          if (relative) {
+            return this.securityManager.readSecureFile(relative);
+          }
         }
         return fs.readFileSync(filePath, 'utf-8');
       } catch (error) {
@@ -162,7 +205,7 @@ export class FileLoader {
   }
   
   private async loadMemoryFiles(): Promise<string[]> {
-    const memoryDir = path.join(this.workspacePath, 'memory');
+    const memoryDir = this.memoryPath;
     const memories: string[] = [];
     
     if (!fs.existsSync(memoryDir)) {
@@ -189,8 +232,8 @@ export class FileLoader {
       
       for (const file of files) {
         const filePath = path.join(memoryDir, file);
-        const relative = path.relative(this.workspacePath, filePath).replace(/\\/g, '/');
-        const content = this.securityManager
+        const relative = this.getRelativePath(filePath);
+        const content = this.securityManager && relative
           ? this.securityManager.readSecureFile(relative)
           : fs.readFileSync(filePath, 'utf-8');
         const date = file.replace('.md', '');
@@ -207,7 +250,7 @@ export class FileLoader {
   }
   
   private async loadRecentMemory(): Promise<string[]> {
-    const memoryDir = path.join(this.workspacePath, 'memory');
+    const memoryDir = this.memoryPath;
     const recent: string[] = [];
     
     if (!fs.existsSync(memoryDir)) {
@@ -227,8 +270,8 @@ export class FileLoader {
       // Load today's memory
       const todayFile = path.join(memoryDir, `${todayStr}.md`);
       if (fs.existsSync(todayFile)) {
-        const relative = path.relative(this.workspacePath, todayFile).replace(/\\/g, '/');
-        const content = this.securityManager
+        const relative = this.getRelativePath(todayFile);
+        const content = this.securityManager && relative
           ? this.securityManager.readSecureFile(relative)
           : fs.readFileSync(todayFile, 'utf-8');
         recent.push(`[Today ${todayStr}] ${content.substring(0, 800)}${content.length > 800 ? '...' : ''}`);
@@ -237,8 +280,8 @@ export class FileLoader {
       // Load yesterday's memory
       const yesterdayFile = path.join(memoryDir, `${yesterdayStr}.md`);
       if (fs.existsSync(yesterdayFile)) {
-        const relative = path.relative(this.workspacePath, yesterdayFile).replace(/\\/g, '/');
-        const content = this.securityManager
+        const relative = this.getRelativePath(yesterdayFile);
+        const content = this.securityManager && relative
           ? this.securityManager.readSecureFile(relative)
           : fs.readFileSync(yesterdayFile, 'utf-8');
         recent.push(`[Yesterday ${yesterdayStr}] ${content.substring(0, 800)}${content.length > 800 ? '...' : ''}`);
@@ -252,7 +295,7 @@ export class FileLoader {
   }
   
   async updateMemory(entry: string): Promise<void> {
-    const memoryDir = path.join(this.workspacePath, 'memory');
+    const memoryDir = this.memoryPath;
     const today = new Date().toISOString().split('T')[0];
     const todayFile = path.join(memoryDir, `${today}.md`);
     
@@ -267,9 +310,13 @@ export class FileLoader {
       const memoryEntry = `\n\n---\n[${timestamp}] ${entry}`;
       
       if (this.securityManager) {
-        const relative = path.relative(this.workspacePath, todayFile).replace(/\\/g, '/');
-        const existing = fs.existsSync(todayFile) ? this.securityManager.readSecureFile(relative) : '';
-        this.securityManager.writeSecureFile(relative, existing + memoryEntry);
+        const relative = this.getRelativePath(todayFile);
+        const existing = relative && fs.existsSync(todayFile) ? this.securityManager.readSecureFile(relative) : '';
+        if (relative) {
+          this.securityManager.writeSecureFile(relative, existing + memoryEntry);
+        } else {
+          fs.appendFileSync(todayFile, memoryEntry, 'utf-8');
+        }
       } else {
         fs.appendFileSync(todayFile, memoryEntry, 'utf-8');
       }
@@ -293,9 +340,15 @@ export class FileLoader {
       const memoryEntry = `\n\n## ${timestamp}\n${entry}`;
       
       if (this.securityManager) {
-        const relative = path.relative(this.workspacePath, memoryFile).replace(/\\/g, '/');
-        const existing = fs.existsSync(memoryFile) ? this.securityManager.readSecureFile(relative) : '# MEMORY.md - Long-Term Memory\n\n';
-        this.securityManager.writeSecureFile(relative, existing + memoryEntry);
+        const relative = this.getRelativePath(memoryFile);
+        const existing = relative && fs.existsSync(memoryFile)
+          ? this.securityManager.readSecureFile(relative)
+          : '# MEMORY.md - Long-Term Memory\n\n';
+        if (relative) {
+          this.securityManager.writeSecureFile(relative, existing + memoryEntry);
+        } else {
+          fs.appendFileSync(memoryFile, memoryEntry, 'utf-8');
+        }
       } else {
         fs.appendFileSync(memoryFile, memoryEntry, 'utf-8');
       }
@@ -303,6 +356,27 @@ export class FileLoader {
     } catch (error) {
       console.error('Failed to update long-term memory:', error instanceof Error ? error.message : String(error));
     }
+  }
+
+  private getRelativePath(targetPath: string): string | null {
+    const relative = path.relative(this.workspacePath, targetPath).replace(/\\/g, '/');
+    if (!relative || relative === '') {
+      return '';
+    }
+    if (relative.startsWith('..')) {
+      return null;
+    }
+    return relative;
+  }
+
+  private toSecureRelativePath(baseRelative: string | null, filename: string): string | null {
+    if (baseRelative === null) {
+      return null;
+    }
+    if (!baseRelative) {
+      return filename;
+    }
+    return path.posix.join(baseRelative, filename);
   }
 }
 

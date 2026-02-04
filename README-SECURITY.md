@@ -7,22 +7,23 @@ OpenClaw Lite implements a **security-first architecture** with isolated credent
 ## 📁 Directory Structure
 
 ```
-~/.clawlite/                  # Application data (readable by agent)
+~/.openclaw-lite/             # Application data (readable by agent)
 ├── workspace/                # Identity files (SOUL.md, USER.md, etc.)
 ├── skills/                   # Verified skills
 ├── memory/                   # Session memory
 ├── logs/                     # Audit logs
-└── config.json              # Configuration
+├── config/                   # Tool/config files
+└── openclaw-lite.json        # Configuration
 
-~/.clawlite-secure/          # Credentials (isolated, strict permissions)
-├── encryption.key           # AES-256-GCM encryption key
-└── [future credentials]     # API keys, tokens, etc.
+~/.openclaw-lite/secure/      # Credentials (isolated, strict permissions)
+├── encryption.key            # AES-256-GCM encryption key
+└── [future credentials]      # API keys, tokens, etc.
 ```
 
 ## 🔐 Key Security Features
 
 ### 1. Isolated Credential Storage
-- **Agent cannot read** `.clawlite-secure` directory directly
+- **Agent cannot read** `.openclaw-lite/secure` directory directly
 - **Strict permissions** (700 on directory, 600 on keys)
 - **Wrapper script** provides keys via environment variables only
 
@@ -51,28 +52,28 @@ OpenClaw Lite implements a **security-first architecture** with isolated credent
 ./scripts/secure-install.sh
 
 # Use the secure wrapper
-~/.clawlite/claw-lite-secure --help
+~/.openclaw-lite/claw-lite-secure --help
 
 # Enable encryption
-~/.clawlite/claw-lite-secure security --encrypt
+~/.openclaw-lite/claw-lite-secure security --encrypt
 ```
 
 ### Manual Setup
 1. **Create directories:**
    ```bash
-   mkdir -p ~/.clawlite ~/.clawlite-secure
-   chmod 700 ~/.clawlite-secure
+   mkdir -p ~/.openclaw-lite ~/.openclaw-lite/secure
+   chmod 700 ~/.openclaw-lite/secure
    ```
 
 2. **Generate encryption key:**
    ```bash
-   openssl rand -base64 32 > ~/.clawlite-secure/encryption.key
-   chmod 600 ~/.clawlite-secure/encryption.key
+   openssl rand -base64 32 > ~/.openclaw-lite/secure/encryption.key
+   chmod 600 ~/.openclaw-lite/secure/encryption.key
    ```
 
 3. **Set environment variable:**
    ```bash
-   export OPENCLAW_ENCRYPTION_KEY=$(cat ~/.clawlite-secure/encryption.key)
+   export OPENCLAW_ENCRYPTION_KEY=$(cat ~/.openclaw-lite/secure/encryption.key)
    ```
 
 ## 🔧 Security Components

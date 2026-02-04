@@ -170,8 +170,7 @@ Example response:
         messages,
         systemPrompt,
         undefined, // taskRequirements
-        undefined, // forceModel
-        { temperature: 0.3 } // Lower temperature for more conservative analysis
+        undefined // forceModel
       );
 
       // Parse agent response

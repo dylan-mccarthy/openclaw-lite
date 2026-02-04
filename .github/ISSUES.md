@@ -7,7 +7,7 @@
 **Priority:** High  
 **Description:** Need a secure credential/key storage system isolated from agent access.  
 **Requirements:**
-- `.clawlite-secure` folder for credentials/keys
+- `.openclaw-lite/secure` folder for credentials/keys
 - Agent can call encryption/decryption but cannot read keys
 - Keys cannot be modified by agent
 - Keys cannot be accidentally exposed via logs/memory
@@ -17,8 +17,8 @@
 **Priority:** High  
 **Description:** Installation script that sets up secure environment.  
 **Requirements:**
-- Creates `.clawlite` folder for application data
-- Creates `.clawlite-secure` for credentials
+- Creates `.openclaw-lite` folder for application data
+- Creates `.openclaw-lite/secure` for credentials
 - Generates encryption key
 - Sets up secure file permissions
 - Configures environment

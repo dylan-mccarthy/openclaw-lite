@@ -57,12 +57,11 @@ export class ToolBridge {
         throw new Error(`Tool not found: ${toolName}`);
       }
       
-      // Check if tool requires approval
-      if (tool.definition.requiresApproval) {
+      // Approval gating (disabled by default for development)
+      if (this.options.requireApprovalForDangerous && tool.definition.requiresApproval) {
         console.log(`[ToolBridge] Tool ${toolName} requires approval, checking...`);
-        // For Phase 1, auto-approve after timeout
-        // In Phase 2, implement proper approval system
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // For Phase 2+, implement proper approval system
+        await new Promise(resolve => setTimeout(resolve, this.options.autoApproveTimeout ?? 2000));
       }
       
       // Create execution context

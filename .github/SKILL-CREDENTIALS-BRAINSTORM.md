@@ -11,7 +11,7 @@ Skills that interact with external services (APIs, databases, cloud services) ne
 
 ### Idea 1: Credential Vault with Skill-Specific Keys
 ```
-.clawlite-secure/
+.openclaw-lite/secure/
 ├── encryption.key           # Master encryption
 ├── credentials/
 │   ├── github-token.skill1 # Encrypted per-skill credentials
@@ -181,7 +181,7 @@ User Commands:
 - User prompt system
 
 ### Phase 2: Secure Storage
-- Extend `.clawlite-secure` for credentials
+- Extend `.openclaw-lite/secure` for credentials
 - Per-skill encryption keys
 - Credential manifest storage
 

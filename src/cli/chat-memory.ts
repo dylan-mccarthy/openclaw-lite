@@ -2,7 +2,7 @@ import chalk from 'chalk';
 import ora from 'ora';
 import { OllamaIntegration } from '../ollama/integration.js';
 import { MemoryManager } from '../memory/memory-manager.js';
-import { getConfigManager } from '../config/config.js';
+import { initializeConfig } from '../config/openclaw-lite-config.js';
 import type { Message } from '../context/types.js';
 
 export async function startInteractiveChat(options: {
@@ -21,12 +21,12 @@ export async function startInteractiveChat(options: {
   // Setup memory if enabled
   let memoryManager: MemoryManager | null = null;
   let currentSessionId: string = options.sessionId || '';
-  const configManager = getConfigManager();
+  const configManager = await initializeConfig();
   const config = configManager.getConfig();
   
   if (options.saveSession && config.memory.enabled) {
     memoryManager = new MemoryManager({
-      storagePath: config.memory.storagePath,
+      storagePath: configManager.getMemoryPath(),
       maxSessions: config.memory.maxSessions,
       pruneDays: config.memory.pruneDays,
     });

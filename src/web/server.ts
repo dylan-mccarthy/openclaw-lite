@@ -41,6 +41,9 @@ export class WebServer {
   private options: Required<WebServerOptions>;
   private systemPrompt: string = '';
   private pendingApprovals: Map<string, { call: ToolCall; resolve: (approved: boolean) => void }> = new Map();
+  private approvalsDisabled: boolean = false;
+  private workspacePath: string;
+  private identityPath: string;
   
   constructor(options: WebServerOptions = {}) {
     // Load default model from config
@@ -79,7 +82,15 @@ export class WebServer {
     
     // Use configured workspace
     const workspacePath = config.workspace.path;
-    this.fileLoader = new FileLoader(workspacePath);
+    const identityPath = configManager.getIdentityPath();
+    const memoryPath = configManager.getMemoryPath();
+    this.workspacePath = workspacePath;
+    this.identityPath = identityPath;
+    this.fileLoader = new FileLoader({
+      workspacePath,
+      identityPath,
+      memoryPath
+    });
     console.log(`📁 Workspace: ${workspacePath}`);
     
     // Initialize memory manager if enabled
@@ -115,14 +126,25 @@ export class WebServer {
     }
     
     // Initialize tool manager
+    this.approvalsDisabled = config.tools.disableApprovals;
+    const requireApprovalForDangerous = this.approvalsDisabled ? false : true;
+    
     this.toolManager = new ToolManager({
       workspacePath,
-      requireApprovalForDangerous: config.tools.requireApprovalForDangerous,
+      identityPath,
+      memoryPath,
+      requireApprovalForDangerous,
+      disableApprovals: this.approvalsDisabled,
       maxLogSize: 1000,
       configPath: configManager.getToolConfigPath()
     });
     
     console.log('🔧 Tool system initialized');
+    if (this.approvalsDisabled) {
+      console.log('⚠️  Tool approvals DISABLED (development mode)');
+    } else {
+      console.log('🔐 Tool approvals ENABLED for dangerous tools');
+    }
     
     // Initialize OpenClaw-style tool integration
     this.toolIntegration = new OpenClawToolIntegration(
@@ -225,8 +247,14 @@ export class WebServer {
                   padding: 0;
                   background: #0f172a;
                   color: #e2e8f0;
+                  height: 100vh;
+                  overflow: hidden;
+                }
+
+                .app {
                   display: flex;
                   height: 100vh;
+                  width: 100vw;
                   overflow: hidden;
                 }
                 
@@ -404,22 +432,25 @@ export class WebServer {
                   flex: 1;
                   display: flex;
                   flex-direction: column;
+                  gap: 12px;
+                  padding: 16px;
                   overflow: hidden;
                 }
                 
                 .header {
-                  padding: 20px;
+                  padding: 16px 20px;
                   background: #1e293b;
-                  border-bottom: 1px solid #334155;
+                  border: 1px solid #334155;
+                  border-radius: 12px;
                 }
                 
                 .chat-container {
                   background: #1e293b;
-                  border-radius: 10px;
-                  padding: 20px;
-                  margin-bottom: 20px;
+                  border-radius: 12px;
+                  padding: 16px;
                   border: 1px solid #334155;
-                  height: 400px;
+                  flex: 1;
+                  min-height: 0;
                   overflow-y: auto;
                 }
                 .message {
@@ -441,6 +472,10 @@ export class WebServer {
                 .input-area {
                   display: flex;
                   gap: 10px;
+                  background: #1e293b;
+                  border: 1px solid #334155;
+                  border-radius: 12px;
+                  padding: 12px;
                 }
                 input {
                   flex: 1;
@@ -568,40 +603,75 @@ export class WebServer {
                   background: #0f172a;
                   border-radius: 4px;
                 }
+
+                .pill-button {
+                  padding: 6px 12px;
+                  background: #475569;
+                  color: #e2e8f0;
+                  border: none;
+                  border-radius: 6px;
+                  cursor: pointer;
+                  font-size: 14px;
+                }
+
+                .pill-button:hover {
+                  background: #64748b;
+                }
+
+                .sidebar-placeholder {
+                  font-size: 13px;
+                  color: #94a3b8;
+                  line-height: 1.4;
+                }
               </style>
             </head>
             <body>
-              <div class="header">
-                <h1>🤖 OpenClaw Lite Web UI</h1>
-                <div class="model-selector">
-                  <label for="model-select">Model:</label>
-                  <select id="model-select" onchange="changeModel(this.value)">
-                    <option value="huihui_ai/qwen3-abliterated:latest" ${this.options.model === 'huihui_ai/qwen3-abliterated:latest' ? 'selected' : ''}>qwen3-abliterated</option>
-                    <option value="llama3.1:8b" ${this.options.model === 'llama3.1:8b' ? 'selected' : ''}>llama3.1:8b</option>
-                    <option value="qwen2.5-coder:7b" ${this.options.model === 'qwen2.5-coder:7b' ? 'selected' : ''}>qwen2.5-coder:7b</option>
-                    <option value="gemma3:latest" ${this.options.model === 'gemma3:latest' ? 'selected' : ''}>gemma3:latest</option>
-                    <option value="deepseek-r1:8b" ${this.options.model === 'deepseek-r1:8b' ? 'selected' : ''}>deepseek-r1:8b</option>
-                  </select>
-                  <button id="refresh-models" onclick="refreshModels()" title="Refresh available models">🔄</button>
-                  <span class="model-status" id="model-status">✅</span>
-                </div>
-                <div class="session-controls" style="margin-top: 10px;">
-                  <button onclick="newSession()" title="Start new conversation" style="padding: 6px 12px; background: #475569; color: #e2e8f0; border: none; border-radius: 6px; cursor: pointer; font-size: 14px;">🆕 New Session</button>
-                  <button onclick="listSessions()" title="View saved sessions" style="padding: 6px 12px; background: #475569; color: #e2e8f0; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; margin-left: 5px;">📋 Sessions</button>
-                  <span id="session-status" style="margin-left: 10px; font-size: 14px; color: #94a3b8;"></span>
-                </div>
-                <p>URL: ${this.options.ollamaUrl} | Context: ${this.options.maxContextTokens.toLocaleString()} tokens</p>
-              </div>
-              
-              <div class="chat-container" id="chat">
-                <div class="message assistant-message">
-                  Hello! I'm your OpenClaw Lite assistant. How can I help you today?
-                </div>
-              </div>
-              
-              <div class="input-area">
-                <input type="text" id="message" placeholder="Type your message..." autocomplete="off">
-                <button onclick="sendMessage()">Send</button>
+              <div class="app">
+                <aside class="sidebar">
+                  <div class="sidebar-header">
+                    <div style="font-weight: 700; font-size: 16px;">OpenClaw Lite</div>
+                    <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Local tools & activity</div>
+                  </div>
+                  <div class="sidebar-content">
+                    <div class="sidebar-placeholder">
+                      Tools, activity, and file views will show up here. Use the chat panel to interact with the agent.
+                    </div>
+                  </div>
+                </aside>
+                <main class="main-content">
+                  <div class="header">
+                    <h1 style="margin: 0 0 8px 0;">🤖 OpenClaw Lite</h1>
+                    <div class="model-selector">
+                      <label for="model-select">Model:</label>
+                      <select id="model-select" onchange="changeModel(this.value)">
+                        <option value="huihui_ai/qwen3-abliterated:latest" ${this.options.model === 'huihui_ai/qwen3-abliterated:latest' ? 'selected' : ''}>qwen3-abliterated</option>
+                        <option value="llama3.1:8b" ${this.options.model === 'llama3.1:8b' ? 'selected' : ''}>llama3.1:8b</option>
+                        <option value="qwen2.5-coder:7b" ${this.options.model === 'qwen2.5-coder:7b' ? 'selected' : ''}>qwen2.5-coder:7b</option>
+                        <option value="gemma3:latest" ${this.options.model === 'gemma3:latest' ? 'selected' : ''}>gemma3:latest</option>
+                        <option value="deepseek-r1:8b" ${this.options.model === 'deepseek-r1:8b' ? 'selected' : ''}>deepseek-r1:8b</option>
+                      </select>
+                      <button id="refresh-models" onclick="refreshModels()" title="Refresh available models">🔄</button>
+                      <span class="model-status" id="model-status">✅</span>
+                    </div>
+                    <div class="session-controls" style="margin-top: 10px;">
+                      <button onclick="newSession()" title="Start new conversation" class="pill-button">🆕 New Session</button>
+                      <button onclick="listSessions()" title="View saved sessions" class="pill-button" style="margin-left: 6px;">📋 Sessions</button>
+                      <span id="session-status" style="margin-left: 10px; font-size: 14px; color: #94a3b8;"></span>
+                    </div>
+                    <p style="margin: 10px 0 0 0; color: #94a3b8;">URL: ${this.options.ollamaUrl} | Context: ${this.options.maxContextTokens.toLocaleString()} tokens</p>
+                  </div>
+                  
+                  <div class="chat-container" id="chat">
+                    <div class="message assistant-message">
+                      Hello! I'm your OpenClaw Lite assistant. How can I help you today?
+                    </div>
+                  </div>
+                  
+                  <div class="input-area">
+                    <input type="text" id="message" placeholder="Type your message..." autocomplete="off">
+                    <button onclick="sendMessage()">Send</button>
+                  </div>
+                </main>
               </div>
               
               <script>
@@ -624,7 +694,7 @@ export class WebServer {
                   const thinking = addMessage('Thinking...', 'assistant');
                   
                   try {
-                    const response = await fetch('/api/chat', {
+                    const response = await fetch('/api/chat-with-tools', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({ 
@@ -784,6 +854,31 @@ export class WebServer {
                   } finally {
                     select.disabled = false;
                     refreshBtn.disabled = false;
+                  }
+                }
+
+                function newSession() {
+                  const chatEl = document.getElementById('chat');
+                  const sessionStatus = document.getElementById('session-status');
+                  if (chatEl) {
+                    chatEl.innerHTML = '<div class="message assistant-message">New session started. How can I help?</div>';
+                  }
+                  if (sessionStatus) {
+                    sessionStatus.textContent = 'New session started';
+                  }
+                }
+
+                async function listSessions() {
+                  try {
+                    const response = await fetch('/api/sessions');
+                    const data = await response.json();
+                    if (Array.isArray(data.sessions) && data.sessions.length > 0) {
+                      addMessage('Sessions: ' + data.sessions.map((s) => s.sessionId).join(', '), 'assistant');
+                    } else {
+                      addMessage('No saved sessions found.', 'assistant');
+                    }
+                  } catch (error) {
+                    addMessage('Failed to load sessions.', 'assistant');
                   }
                 }
                 
@@ -1324,6 +1419,9 @@ export class WebServer {
           sessionId: sessionId || `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
           workspacePath: this.toolManager['options'].workspacePath,
           requireApproval: async (call: ToolCall) => {
+            if (this.approvalsDisabled) {
+              return true;
+            }
             // Store the approval request
             return new Promise((resolve) => {
               const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -1332,15 +1430,6 @@ export class WebServer {
               // In a real implementation, this would trigger a UI notification
               console.log(`[TOOL] Approval required for ${call.tool}:`, call.arguments);
               console.log(`[TOOL] Approval ID: ${approvalId}`);
-              
-              // For now, auto-approve after 2 seconds
-              setTimeout(() => {
-                if (this.pendingApprovals.has(approvalId)) {
-                  console.log(`[TOOL] Auto-approving ${approvalId}`);
-                  this.pendingApprovals.delete(approvalId);
-                  resolve(true);
-                }
-              }, 2000);
             });
           },
           logUsage: async (log: ToolUsageLog) => {
@@ -2078,8 +2167,8 @@ export class WebServer {
         try {
           const fs = await import('fs');
           const path = await import('path');
-          const soulPath = path.join('/home/openclaw/.openclaw/workspace', 'SOUL.md');
-          const userPath = path.join('/home/openclaw/.openclaw/workspace', 'USER.md');
+          const soulPath = path.join(this.identityPath, 'SOUL.md');
+          const userPath = path.join(this.identityPath, 'USER.md');
           
           let soulContent = '';
           let userContent = '';
@@ -2144,29 +2233,33 @@ You are a helpful AI assistant running in OpenClaw Lite.
     }
     
     // Check Ollama health
-    console.log('\n🔍 Checking Ollama connection...');
-    
-    try {
-      const health = await this.integration.healthCheck();
+    if (process.env.OPENCLAW_LITE_SKIP_OLLAMA_CHECK === '1') {
+      console.log('\n⚠️  Skipping Ollama health check (OPENCLAW_LITE_SKIP_OLLAMA_CHECK=1)');
+    } else {
+      console.log('\n🔍 Checking Ollama connection...');
       
-      if (!health.ollama) {
-        console.log('❌ Ollama not running at', this.options.ollamaUrl);
-        console.log('   Start it with: ollama serve');
+      try {
+        const health = await this.integration.healthCheck();
+        
+        if (!health.ollama) {
+          console.log('❌ Ollama not running at', this.options.ollamaUrl);
+          console.log('   Start it with: ollama serve');
+          process.exit(1);
+        }
+        
+        console.log('✅ Ollama connected');
+        console.log(`   Models available: ${health.models.length}`);
+        console.log(`   Using model: ${this.options.model}`);
+        
+        if (!health.models.includes(this.options.model.replace('ollama/', ''))) {
+          console.log(`⚠️  Model "${this.options.model}" not found, using default`);
+        }
+        
+      } catch (error) {
+        console.log('❌ Failed to connect to Ollama:', error instanceof Error ? error.message : String(error));
+        console.log(`   URL: ${this.options.ollamaUrl}`);
         process.exit(1);
       }
-      
-      console.log('✅ Ollama connected');
-      console.log(`   Models available: ${health.models.length}`);
-      console.log(`   Using model: ${this.options.model}`);
-      
-      if (!health.models.includes(this.options.model.replace('ollama/', ''))) {
-        console.log(`⚠️  Model "${this.options.model}" not found, using default`);
-      }
-      
-    } catch (error) {
-      console.log('❌ Failed to connect to Ollama:', error instanceof Error ? error.message : String(error));
-      console.log(`   URL: ${this.options.ollamaUrl}`);
-      process.exit(1);
     }
     
     // Start server

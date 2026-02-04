@@ -8,7 +8,7 @@ echo "🔐 OpenClaw Lite Secure Installation"
 echo "====================================="
 
 # Check for existing installation
-if [ -d "$HOME/.clawlite" ] || [ -d "$HOME/.clawlite-secure" ]; then
+if [ -d "$HOME/.openclaw-lite" ] || [ -d "$HOME/.openclaw-lite/secure" ]; then
   echo "⚠️  Existing OpenClaw Lite installation detected."
   read -p "Do you want to reinstall? (y/n): " -n 1 -r
   echo
@@ -20,14 +20,14 @@ fi
 
 # Create secure directories
 echo "📁 Creating secure directories..."
-mkdir -p "$HOME/.clawlite"
-mkdir -p "$HOME/.clawlite-secure"
+mkdir -p "$HOME/.openclaw-lite"
+mkdir -p "$HOME/.openclaw-lite/secure"
 
 # Set strict permissions on secure directory
-chmod 700 "$HOME/.clawlite-secure"
+chmod 700 "$HOME/.openclaw-lite/secure"
 
 # Generate encryption key if not exists
-KEY_FILE="$HOME/.clawlite-secure/encryption.key"
+KEY_FILE="$HOME/.openclaw-lite/secure/encryption.key"
 if [ ! -f "$KEY_FILE" ]; then
   echo "🔑 Generating encryption key..."
   openssl rand -base64 32 > "$KEY_FILE"
@@ -39,27 +39,51 @@ fi
 
 # Generate installation ID
 INSTALL_ID=$(uuidgen)
-echo "$INSTALL_ID" > "$HOME/.clawlite/install-id"
-chmod 600 "$HOME/.clawlite/install-id"
+echo "$INSTALL_ID" > "$HOME/.openclaw-lite/install-id"
+chmod 600 "$HOME/.openclaw-lite/install-id"
 
 # Create default config
-CONFIG_FILE="$HOME/.clawlite/config.json"
+CONFIG_FILE="$HOME/.openclaw-lite/openclaw-lite.json"
 if [ ! -f "$CONFIG_FILE" ]; then
   cat > "$CONFIG_FILE" << EOF
 {
-  "version": "1.0.0",
-  "installId": "$INSTALL_ID",
-  "installDate": "$(date -Iseconds)",
-  "security": {
-    "encryptionEnabled": true,
-    "skillVerificationStrict": true,
-    "auditLogging": true
+  "workspace": {
+    "path": "\$HOME/.openclaw-lite",
+    "identityPath": "workspace",
+    "memoryPath": "memory",
+    "configPath": "config",
+    "logsPath": "logs",
+    "secureStoragePath": "secure"
   },
-  "paths": {
-    "workspace": "\$HOME/.clawlite/workspace",
-    "skills": "\$HOME/.clawlite/skills",
-    "memory": "\$HOME/.clawlite/memory",
-    "secureStorage": "\$HOME/.clawlite-secure"
+  "tools": {
+    "configPath": "config/tool-config.json",
+    "requireApprovalForDangerous": false,
+    "defaultDangerousTools": [],
+    "disableApprovals": true
+  },
+  "ollama": {
+    "url": "http://localhost:11434",
+    "defaultModel": "llama3.1:8b",
+    "temperature": 0.7,
+    "maxTokens": 2048,
+    "timeoutMs": 120000
+  },
+  "memory": {
+    "enabled": true,
+    "storagePath": "memory",
+    "maxSessions": 100,
+    "pruneDays": 30
+  },
+  "web": {
+    "port": 3000,
+    "enableCors": true,
+    "maxContextTokens": 8192
+  },
+  "agent": {
+    "defaultModel": "llama3.1:8b",
+    "temperature": 0.7,
+    "timeoutMs": 120000,
+    "maxToolCallsPerTurn": 10
   }
 }
 EOF
@@ -68,14 +92,14 @@ EOF
 fi
 
 # Create workspace structure
-mkdir -p "$HOME/.clawlite/workspace"
-mkdir -p "$HOME/.clawlite/skills"
-mkdir -p "$HOME/.clawlite/memory"
-mkdir -p "$HOME/.clawlite/logs"
+mkdir -p "$HOME/.openclaw-lite/workspace"
+mkdir -p "$HOME/.openclaw-lite/skills"
+mkdir -p "$HOME/.openclaw-lite/memory"
+mkdir -p "$HOME/.openclaw-lite/logs"
 
 # Create default identity files
-if [ ! -f "$HOME/.clawlite/workspace/SOUL.md" ]; then
-  cat > "$HOME/.clawlite/workspace/SOUL.md" << 'EOF'
+if [ ! -f "$HOME/.openclaw-lite/workspace/SOUL.md" ]; then
+  cat > "$HOME/.openclaw-lite/workspace/SOUL.md" << 'EOF'
 # SOUL.md - Who I Am
 
 *I'm an AI assistant created to help you. I'm curious, resourceful, and eager to learn.*
@@ -95,8 +119,8 @@ EOF
   echo "✅ Default SOUL.md created"
 fi
 
-if [ ! -f "$HOME/.clawlite/workspace/USER.md" ]; then
-  cat > "$HOME/.clawlite/workspace/USER.md" << 'EOF'
+if [ ! -f "$HOME/.openclaw-lite/workspace/USER.md" ]; then
+  cat > "$HOME/.openclaw-lite/workspace/USER.md" << 'EOF'
 # USER.md - About You
 
 *This file helps me understand who I'm helping.*
@@ -114,7 +138,7 @@ EOF
 fi
 
 # Create .env file with secure references
-ENV_FILE="$HOME/.clawlite/.env"
+ENV_FILE="$HOME/.openclaw-lite/.env"
 if [ ! -f "$ENV_FILE" ]; then
   # Read encryption key (for reference only, not stored in plain text)
   ENCRYPTION_KEY=$(cat "$KEY_FILE")
@@ -125,9 +149,9 @@ if [ ! -f "$ENV_FILE" ]; then
 # Store in secure location or use environment variables
 
 # Paths
-OPENCLAW_WORKSPACE=\$HOME/.clawlite/workspace
-OPENCLAW_SKILLS_PATH=\$HOME/.clawlite/skills
-OPENCLAW_MEMORY_PATH=\$HOME/.clawlite/memory
+OPENCLAW_WORKSPACE=\$HOME/.openclaw-lite/workspace
+OPENCLAW_SKILLS_PATH=\$HOME/.openclaw-lite/skills
+OPENCLAW_MEMORY_PATH=\$HOME/.openclaw-lite/memory
 
 # Security (reference only - actual key in secure storage)
 # OPENCLAW_ENCRYPTION_KEY=[KEY IN SECURE STORAGE]
@@ -153,7 +177,7 @@ EOF
 fi
 
 # Create secure wrapper script
-WRAPPER_FILE="$HOME/.clawlite/claw-lite-secure"
+WRAPPER_FILE="$HOME/.openclaw-lite/claw-lite-secure"
 cat > "$WRAPPER_FILE" << 'EOF'
 #!/bin/bash
 # Secure wrapper for OpenClaw Lite
@@ -162,7 +186,7 @@ cat > "$WRAPPER_FILE" << 'EOF'
 set -e
 
 # Load encryption key from secure storage
-KEY_FILE="$HOME/.clawlite-secure/encryption.key"
+KEY_FILE="$HOME/.openclaw-lite/secure/encryption.key"
 if [ ! -f "$KEY_FILE" ]; then
   echo "❌ Encryption key not found in secure storage"
   exit 1
@@ -193,12 +217,12 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$HOME/.clawlite/claw-lite-secure web --port 3000
+ExecStart=$HOME/.openclaw-lite/claw-lite-secure web --port 3000
 Restart=on-failure
 RestartSec=5
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
 Environment="HOME=$HOME"
-WorkingDirectory=$HOME/.clawlite
+WorkingDirectory=$HOME/.openclaw-lite
 
 [Install]
 WantedBy=default.target
@@ -213,8 +237,8 @@ echo "🎉 Installation Complete!"
 echo "========================"
 echo ""
 echo "📁 Secure directories created:"
-echo "   • $HOME/.clawlite          (application data)"
-echo "   • $HOME/.clawlite-secure   (credentials - strict permissions)"
+echo "   • $HOME/.openclaw-lite          (application data)"
+echo "   • $HOME/.openclaw-lite/secure   (credentials - strict permissions)"
 echo ""
 echo "🔑 Security features:"
 echo "   • Encryption key: $KEY_FILE"
@@ -223,7 +247,7 @@ echo "   • Install ID: $INSTALL_ID"
 echo ""
 echo "🚀 Next steps:"
 echo "1. Review configuration: $CONFIG_FILE"
-echo "2. Customize identity files in $HOME/.clawlite/workspace/"
+echo "2. Customize identity files in $HOME/.openclaw-lite/workspace/"
 echo "3. Use the secure wrapper: $WRAPPER_FILE --help"
 echo "4. Enable encryption: $WRAPPER_FILE security --encrypt"
 echo ""

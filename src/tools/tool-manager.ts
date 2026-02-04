@@ -19,10 +19,15 @@ export class ToolManager implements ToolRegistry {
   private tools: Map<string, { definition: ToolDefinition; handler: ToolHandler }> = new Map();
   private usageLog: ToolUsageLog[] = [];
   private configManager: ToolConfigManager;
+  private identityRelativePath: string | null;
+  private memoryRelativePath: string | null;
 
   constructor(private options: {
     workspacePath: string;
+    identityPath?: string;
+    memoryPath?: string;
     requireApprovalForDangerous?: boolean;
+    disableApprovals?: boolean;
     maxLogSize?: number;
     configPath?: string;
   }) {
@@ -31,6 +36,9 @@ export class ToolManager implements ToolRegistry {
       configPath,
       defaultDangerousTools: [] // Empty - no tools dangerous by default
     });
+
+    this.identityRelativePath = this.getRelativePath(options.identityPath, options.workspacePath);
+    this.memoryRelativePath = this.getRelativePath(options.memoryPath, options.workspacePath);
     
     this.registerDefaultTools();
   }
@@ -81,8 +89,10 @@ export class ToolManager implements ToolRegistry {
     
     try {
       // Check if approval is required (from config or definition)
-      const requiresApproval = this.configManager.requiresApproval(name) || 
-                              (tool.definition.dangerous && this.options.requireApprovalForDangerous);
+      const requiresApproval = !this.options.disableApprovals && (
+        this.configManager.requiresApproval(name) ||
+        (tool.definition.dangerous && this.options.requireApprovalForDangerous)
+      );
       
       if (requiresApproval) {
         if (context.requireApproval) {
@@ -671,14 +681,19 @@ export class ToolManager implements ToolRegistry {
 
   private async handleRead(args: Record<string, any>, context: ToolContext): Promise<string> {
     const filePath = this.resolvePath(args.path, context.workspacePath);
+    let resolvedPath = filePath;
     
     try {
-      await fs.access(filePath);
+      await fs.access(resolvedPath);
     } catch {
-      throw new Error(`File not found: ${args.path}`);
+      const fallbackPath = await this.resolveReadFallback(args.path, context.workspacePath);
+      if (!fallbackPath) {
+        throw new Error(`File not found: ${args.path}`);
+      }
+      resolvedPath = fallbackPath;
     }
 
-    const content = await fs.readFile(filePath, 'utf-8');
+    const content = await fs.readFile(resolvedPath, 'utf-8');
     
     if (args.offset !== undefined || args.limit !== undefined) {
       const lines = content.split('\n');
@@ -1157,5 +1172,45 @@ export class ToolManager implements ToolRegistry {
     }
     
     return resolved;
+  }
+
+  private getRelativePath(targetPath: string | undefined, workspacePath: string): string | null {
+    if (!targetPath) {
+      return null;
+    }
+    const relative = path.relative(workspacePath, targetPath).replace(/\\/g, '/');
+    if (!relative || relative === '') {
+      return '';
+    }
+    if (relative.startsWith('..')) {
+      return null;
+    }
+    return relative;
+  }
+
+  private async resolveReadFallback(userPath: string, workspacePath: string): Promise<string | null> {
+    const candidates: string[] = [];
+
+    if (this.identityRelativePath !== null) {
+      const identityPrefix = this.identityRelativePath ? `${this.identityRelativePath}/` : '';
+      candidates.push(`${identityPrefix}${userPath}`);
+    }
+
+    if (this.memoryRelativePath !== null) {
+      const memoryPrefix = this.memoryRelativePath ? `${this.memoryRelativePath}/` : '';
+      candidates.push(`${memoryPrefix}${userPath}`);
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const resolved = this.resolvePath(candidate, workspacePath);
+        await fs.access(resolved);
+        return resolved;
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
   }
 }
