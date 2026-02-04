@@ -6,6 +6,9 @@ import { FileLoader } from '../identity/file-loader.js';
 import { MemoryManager } from '../memory/memory-manager.js';
 import { ToolManager } from '../tools/tool-manager.js';
 import { OpenClawToolIntegration } from '../tools/openclaw-tool-integration.js';
+import { AgentIntegration } from '../agent/agent-integration.js';
+import { MemoryIntegration } from '../agent/memory-integration.js';
+import { MemoryStreamingAgent } from '../agent/memory-streaming-agent.js';
 import { getConfigManager } from '../config/config.js';
 import type { Message } from '../context/types.js';
 import type { ToolCall, ToolUsageLog } from '../tools/types.js';
@@ -23,6 +26,9 @@ export class WebServer {
   private app: express.Application;
   private integration: OllamaIntegration;
   private toolIntegration: OpenClawToolIntegration | null = null;
+  private agentIntegration: AgentIntegration | null = null;
+  private memoryStreamingAgent: MemoryStreamingAgent | null = null;
+  private memoryIntegration: MemoryIntegration | null = null;
   private fileLoader: FileLoader;
   private toolManager: ToolManager;
   private memoryManager: MemoryManager | null = null;
@@ -107,6 +113,59 @@ export class WebServer {
       }
     );
     console.log('🤖 AI tool calling enabled (OpenClaw style)');
+    
+    // Initialize agent integration (Phase 1)
+    this.agentIntegration = new AgentIntegration({
+      toolManager: this.toolManager,
+      model: this.options.model,
+      temperature: 0.7,
+      maxToolCalls: 5,
+      maxTurns: 10,
+      timeoutMs: 120000,
+      baseUrl: this.options.ollamaUrl,
+      workspacePath: process.cwd(),
+      sessionId: 'web-server',
+    });
+    console.log('🤖 Agent integration enabled (Phase 1)');
+    
+    // Initialize memory streaming agent (Phase 3)
+    if (this.agentIntegration.getAgentLoop() && this.agentIntegration.getToolBridge()) {
+      // Create memory manager if not already created
+      if (!this.memoryManager) {
+        try {
+          const configManager = getConfigManager();
+          const config = configManager.getConfig();
+          
+          this.memoryManager = new MemoryManager({
+            storagePath: config.memory.storagePath,
+            maxSessions: config.memory.maxSessions,
+            pruneDays: config.memory.pruneDays,
+          });
+          console.log('💾 Memory manager created (was disabled in config)');
+        } catch (error) {
+          console.warn('Failed to create memory manager:', error instanceof Error ? error.message : String(error));
+          console.log('⚠️  Memory features will be disabled');
+        }
+      }
+      
+      if (this.memoryManager) {
+        // Create memory integration
+        this.memoryIntegration = new MemoryIntegration(this.memoryManager, {
+          enabled: true,
+          searchLimit: 5,
+        });
+        
+        // Create memory streaming agent
+        this.memoryStreamingAgent = new MemoryStreamingAgent(
+          this.agentIntegration.getAgentLoop(),
+          this.agentIntegration.getToolBridge(),
+          this.memoryIntegration
+        );
+        console.log('🧠 Memory streaming agent enabled (Phase 3)');
+      } else {
+        console.log('⚠️  Memory streaming agent disabled (no memory manager)');
+      }
+    }
     
     this.app = express();
     this.setupMiddleware();
@@ -1510,6 +1569,361 @@ export class WebServer {
         res.status(500).json({
           error: error instanceof Error ? error.message : 'Unknown error',
           sessionId: clientSessionId || null,
+        });
+      }
+    });
+    
+    // Phase 1: Agent loop endpoint
+    this.app.post('/api/agent/run', async (req, res) => {
+      console.log(`[WEB] /api/agent/run received request`);
+      const { message, systemPrompt: clientSystemPrompt, model } = req.body;
+      
+      console.log(`[WEB] Agent request: message="${message?.substring(0, 50)}...", model=${model || 'default'}`);
+      
+      if (!message || typeof message !== 'string') {
+        console.log(`[WEB] Invalid request: no message`);
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+      
+      if (!this.agentIntegration) {
+        res.status(500).json({ error: 'Agent integration not available' });
+        return;
+      }
+      
+      try {
+        const startTime = Date.now();
+        console.log(`[WEB] Starting agent loop...`);
+        
+        // Use client system prompt or default
+        const systemPrompt = clientSystemPrompt || this.systemPrompt;
+        
+        // Run agent
+        const result = await this.agentIntegration.run(
+          message,
+          systemPrompt
+        );
+        
+        const responseTime = Date.now() - startTime;
+        console.log(`[WEB] Agent completed in ${responseTime}ms`);
+        console.log(`[WEB] Tool executions: ${result.toolExecutions.length}`);
+        console.log(`[WEB] Turns: ${result.turns}`);
+        
+        // Convert to response format
+        const responseData = {
+          response: result.response,
+          toolExecutions: result.toolExecutions.map(exec => ({
+            tool: exec.toolName,
+            success: exec.success,
+            result: exec.result,
+            error: exec.error,
+            duration: exec.duration,
+          })),
+          messages: result.messages.map(msg => ({
+            role: msg.role,
+            content: msg.content,
+            timestamp: msg.timestamp,
+          })),
+          stats: {
+            turns: result.turns,
+            duration: result.duration,
+            toolCount: result.toolExecutions.length,
+          },
+          timing: {
+            total: responseTime,
+          },
+        };
+        
+        res.json(responseData);
+      } catch (error) {
+        console.error(`[WEB] Error in /api/agent/run:`, error);
+        res.status(500).json({ 
+          error: 'Agent execution failed',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    // Phase 2: Streaming agent endpoint (Server-Sent Events)
+    this.app.post('/api/agent/stream', async (req, res) => {
+      console.log(`[WEB] /api/agent/stream received request (SSE)`);
+      const { message, systemPrompt: clientSystemPrompt } = req.body;
+      
+      if (!message || typeof message !== 'string') {
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+      
+      if (!this.memoryStreamingAgent) {
+        res.status(500).json({ error: 'Memory streaming agent not available' });
+        return;
+      }
+      
+      // Set SSE headers
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      
+      // Send initial connection event
+      res.write('event: connected\ndata: {"status": "connected"}\n\n');
+      
+      // Use client system prompt or default
+      const systemPrompt = clientSystemPrompt || this.systemPrompt;
+      
+      try {
+        console.log(`[WEB] Starting streaming agent execution...`);
+        
+        // Run with memory streaming
+        const result = await this.memoryStreamingAgent.runWithMemory(
+          message,
+          systemPrompt,
+          (event) => {
+            // Send event as SSE
+            const sseData = MemoryStreamingAgent.eventToSSE(event);
+            res.write(sseData);
+          }
+        );
+        
+        console.log(`[WEB] Streaming agent completed`);
+        
+        // Send completion event
+        res.write(MemoryStreamingAgent.eventToSSE({ 
+          type: 'agent_end',
+          message: { 
+            role: 'assistant', 
+            content: result.response,
+            timestamp: new Date()
+          } 
+        }));
+        
+      } catch (error) {
+        console.error(`[WEB] Memory streaming agent error:`, error);
+        res.write(MemoryStreamingAgent.eventToSSE({
+          type: 'error',
+          error: error instanceof Error ? error.message : String(error)
+        }));
+      } finally {
+        // End the stream
+        res.end();
+      }
+    });
+    
+    // Phase 2: Steering API endpoints
+    this.app.post('/api/agent/queue', async (req, res) => {
+      console.log(`[WEB] /api/agent/queue received request`);
+      const { message, priority = 'normal', metadata } = req.body;
+      
+      if (!message || typeof message !== 'string') {
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+      
+      if (!this.memoryStreamingAgent) {
+        res.status(500).json({ error: 'Memory agent not available' });
+        return;
+      }
+      
+      try {
+        const queuedMessage: Message = {
+          role: 'user',
+          content: message,
+          timestamp: new Date(),
+        };
+        
+        const messageId = this.memoryStreamingAgent.queueMessage(
+          queuedMessage,
+          priority as any,
+          metadata
+        );
+        
+        console.log(`[WEB] Message queued: ${messageId} with priority ${priority}`);
+        
+        res.json({
+          success: true,
+          messageId,
+          priority,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error queuing message:`, error);
+        res.status(500).json({ 
+          error: 'Failed to queue message',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/agent/interrupt', async (req, res) => {
+      console.log(`[WEB] /api/agent/interrupt received request`);
+      
+      if (!this.memoryStreamingAgent) {
+        res.status(500).json({ error: 'Memory agent not available' });
+        return;
+      }
+      
+      try {
+        const interrupted = this.memoryStreamingAgent.interrupt();
+        
+        res.json({
+          success: interrupted,
+          message: interrupted ? 'Agent interrupted' : 'No active agent to interrupt',
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error interrupting agent:`, error);
+        res.status(500).json({ 
+          error: 'Failed to interrupt agent',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.get('/api/agent/steering-stats', async (req, res) => {
+      console.log(`[WEB] /api/agent/steering-stats requested`);
+      
+      if (!this.memoryStreamingAgent) {
+        res.status(500).json({ error: 'Memory agent not available' });
+        return;
+      }
+      
+      try {
+        const stats = this.memoryStreamingAgent.getSteeringStats();
+        
+        res.json({
+          success: true,
+          stats,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error getting steering stats:`, error);
+        res.status(500).json({ 
+          error: 'Failed to get steering statistics',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    // Phase 3: Memory API endpoints
+    this.app.post('/api/agent/memory/search', async (req, res) => {
+      console.log(`[WEB] /api/agent/memory/search received request`);
+      const { query, limit, minRelevance } = req.body;
+      
+      if (!query || typeof query !== 'string') {
+        res.status(400).json({ error: 'Query is required' });
+        return;
+      }
+      
+      if (!this.memoryIntegration) {
+        res.status(500).json({ error: 'Memory integration not available' });
+        return;
+      }
+      
+      try {
+        const result = await this.memoryIntegration.searchMemory(query, {
+          limit,
+          minRelevance,
+        });
+        
+        res.json({
+          success: true,
+          query,
+          context: result.context,
+          sessions: result.sessions,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error searching memory:`, error);
+        res.status(500).json({ 
+          error: 'Failed to search memory',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.get('/api/agent/memory/stats', async (req, res) => {
+      console.log(`[WEB] /api/agent/memory/stats requested`);
+      
+      if (!this.memoryIntegration) {
+        res.status(500).json({ error: 'Memory integration not available' });
+        return;
+      }
+      
+      try {
+        const stats = this.memoryIntegration.getStats();
+        
+        res.json({
+          success: true,
+          stats,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error getting memory stats:`, error);
+        res.status(500).json({ 
+          error: 'Failed to get memory statistics',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/agent/memory/enable', async (req, res) => {
+      console.log(`[WEB] /api/agent/memory/enable received request`);
+      const { enabled } = req.body;
+      
+      if (!this.memoryIntegration) {
+        res.status(500).json({ error: 'Memory integration not available' });
+        return;
+      }
+      
+      try {
+        const newState = enabled !== false; // Default to true if not specified
+        this.memoryIntegration.setEnabled(newState);
+        
+        res.json({
+          success: true,
+          enabled: newState,
+          message: `Memory ${newState ? 'enabled' : 'disabled'}`,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error toggling memory:`, error);
+        res.status(500).json({ 
+          error: 'Failed to toggle memory',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+    
+    this.app.post('/api/agent/memory/clear', async (req, res) => {
+      console.log(`[WEB] /api/agent/memory/clear received request`);
+      
+      if (!this.memoryIntegration) {
+        res.status(500).json({ error: 'Memory integration not available' });
+        return;
+      }
+      
+      try {
+        this.memoryIntegration.clearMemory();
+        
+        res.json({
+          success: true,
+          message: 'Memory cleared',
+          timestamp: new Date().toISOString(),
+        });
+        
+      } catch (error) {
+        console.error(`[WEB] Error clearing memory:`, error);
+        res.status(500).json({ 
+          error: 'Failed to clear memory',
+          details: error instanceof Error ? error.message : String(error)
         });
       }
     });
