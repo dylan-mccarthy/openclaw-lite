@@ -4,7 +4,9 @@ import type {
   AgentResult,
   ToolDefinition,
   ToolExecutionResult,
-  AgentStreamOptions
+  AgentStreamOptions,
+  TaskPlan,
+  WorkingSummary
 } from './types.js';
 import type { Message } from '../context/types.js';
 import { EventStream } from './event-stream.js';
@@ -14,6 +16,7 @@ import type { AgentHooks, AgentHookContext, BeforeAgentStartResult, BeforeToolCa
 import { OpenClawOpenAIClient } from '../ollama/openclaw-openai-client.js';
 import { ModelTemplateRegistry } from '../ollama/model-templates.js';
 import type { ToolBridge } from './tool-bridge.js';
+import { TaskPlanner } from './task-planner.js';
 
 export interface AgentLoopConfig {
   model: string;
@@ -44,6 +47,25 @@ export class AgentLoop {
   private toolBridge?: ToolBridge;
   private messagingToolOutputs: string[] = [];
   private hooks: Required<AgentHooks>;
+
+  private buildSummaryText(summary: WorkingSummary): string {
+    const lines: string[] = ['## Working Summary'];
+
+    if (summary.changes.length > 0) {
+      lines.push('Changes:', ...summary.changes.map(item => `- ${item}`));
+    }
+    if (summary.decisions.length > 0) {
+      lines.push('Decisions:', ...summary.decisions.map(item => `- ${item}`));
+    }
+    if (summary.openQuestions.length > 0) {
+      lines.push('Open Questions:', ...summary.openQuestions.map(item => `- ${item}`));
+    }
+    if (summary.nextStep) {
+      lines.push(`Next Step: ${summary.nextStep}`);
+    }
+
+    return lines.join('\n');
+  }
   
   constructor(config: AgentLoopConfig) {
     this.client = new OpenClawOpenAIClient({
@@ -149,6 +171,28 @@ export class AgentLoop {
 
     await this.runBeforeAgentStartHooks(hookContext, context, options, stream);
 
+    const planner = new TaskPlanner({
+      maxContextTokens: this.config.maxContextTokens,
+      reservedTokens: this.config.reservedTokens,
+    });
+    const planDecision = planner.shouldPlan(hookContext.prompt, context.systemPrompt);
+    let plan: TaskPlan | undefined;
+    let summary: WorkingSummary | undefined;
+    let currentStepIndex = 0;
+
+    if (planDecision.shouldPlan) {
+      plan = planner.createPlan(hookContext.prompt);
+      summary = planner.createWorkingSummary(plan);
+      context.plan = plan;
+      context.summary = summary;
+
+      this.emitEvent(stream, {
+        type: 'plan_created',
+        plan,
+        summary,
+      }, options);
+    }
+
     // Emit start events
     this.emitEvent(stream, { type: 'agent_start', runId, sessionId }, options);
     this.emitEvent(stream, { type: 'turn_start', runId, sessionId }, options);
@@ -170,6 +214,11 @@ export class AgentLoop {
         ...options,
         runId,
         sessionId,
+      }, {
+        planner,
+        plan,
+        summary,
+        currentStepIndex,
       });
       turns = this.countTurns(context.messages);
     } catch (error) {
@@ -201,6 +250,8 @@ export class AgentLoop {
         startedAt: startTime,
         endedAt: Date.now(),
         status: 'completed',
+        plan,
+        summary: context.summary,
       };
 
       await this.runAfterAgentEndHooks(hookContext, result, options, stream);
@@ -216,7 +267,13 @@ export class AgentLoop {
     context: AgentContext,
     stream: EventStream,
     toolExecutions: ToolExecutionResult[],
-    options?: AgentStreamOptions
+    options?: AgentStreamOptions,
+    planning?: {
+      planner: TaskPlanner;
+      plan?: TaskPlan;
+      summary?: WorkingSummary;
+      currentStepIndex: number;
+    }
   ): Promise<void> {
     let turn = 0;
     let compactionAttempts = 0;
@@ -280,6 +337,22 @@ export class AgentLoop {
             error: executionResult.error,
             duration: executionResult.duration,
           }, options);
+
+          if (planning?.summary) {
+            const summaryPatch = {
+              changes: [
+                executionResult.success
+                  ? `Tool ${executionResult.toolName} completed`
+                  : `Tool ${executionResult.toolName} failed: ${executionResult.error || 'unknown error'}`
+              ],
+            };
+            context.summary = planning.planner.updateWorkingSummary(planning.summary, summaryPatch);
+            planning.summary = context.summary;
+            this.emitEvent(stream, {
+              type: 'summary_update',
+              summary: context.summary,
+            }, options);
+          }
         }
         
         // Continue loop to process tool results
@@ -290,6 +363,35 @@ export class AgentLoop {
           type: 'turn_end',
           message: assistantMessage,
         }, options);
+
+        if (planning?.plan && planning.summary) {
+          const plan = planning.plan;
+          const currentStep = plan.steps[planning.currentStepIndex];
+
+          if (currentStep) {
+            currentStep.status = 'done';
+            const nextStep = plan.steps[planning.currentStepIndex + 1];
+            if (nextStep) {
+              nextStep.status = 'in_progress';
+              planning.currentStepIndex += 1;
+            }
+            context.summary = planning.planner.updateWorkingSummary(planning.summary, {
+              changes: [`Completed step: ${currentStep.title}`],
+              nextStep: nextStep?.title,
+            });
+            planning.summary = context.summary;
+
+            this.emitEvent(stream, {
+              type: 'plan_step',
+              step: currentStep,
+              plan,
+            }, options);
+            this.emitEvent(stream, {
+              type: 'summary_update',
+              summary: context.summary,
+            }, options);
+          }
+        }
         break;
       }
     }
@@ -579,6 +681,10 @@ export class AgentLoop {
     if (tools.length === 0) {
       return systemPrompt;
     }
+
+    if (/^##\s+Tooling/m.test(systemPrompt)) {
+      return systemPrompt;
+    }
     
     const toolDescriptions = tools
       .map(tool => `- ${tool.name}: ${tool.description}`)
@@ -798,6 +904,10 @@ Use plain human language for narration unless in a technical context.
       return;
     }
 
+    if (context.summary && this.applySummaryContext(context, stream, options, reason)) {
+      return;
+    }
+
     const originalCount = context.messages.length;
     const compressionResult = await this.contextManager.compressHistory(
       context.messages,
@@ -816,6 +926,40 @@ Use plain human language for narration unless in a technical context.
       compressionRatio: compressionResult.compressionRatio,
       compactionReason: reason,
     }, options);
+  }
+
+  private applySummaryContext(
+    context: AgentContext,
+    stream: EventStream,
+    options: AgentStreamOptions | undefined,
+    reason: string
+  ): boolean {
+    const summary = context.summary;
+    if (!summary) {
+      return false;
+    }
+
+    const summaryText = this.buildSummaryText(summary);
+    if (!summaryText.trim()) {
+      return false;
+    }
+
+    const tail = context.messages.slice(-2);
+    const summaryMessage: Message = {
+      role: 'user',
+      content: summaryText,
+      timestamp: new Date(),
+    };
+
+    context.messages = [summaryMessage, ...tail];
+
+    this.emitEvent(stream, {
+      type: 'context_replace',
+      summary,
+      replaceReason: `summary_${reason}`,
+    }, options);
+
+    return true;
   }
 
   private isContextOverflowError(error: unknown): boolean {

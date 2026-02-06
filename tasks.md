@@ -45,3 +45,12 @@ Findings
 - [x] Unit tests for loop event ordering and tool call handling.
 - [x] Integration tests for streaming + tool execution + memory.
 - [x] Add trace logs for run IDs, tool timing, and compaction retries.
+
+## Phase 7 - Large Task Handling (Plan + Summarize)
+- [x] Define a task planning + summary model in the agent layer (plan, current step, working summary).
+- [x] Add a planner pass that triggers on large/complex prompts (length + heuristics) and stores a compact step list.
+- [x] Implement step-by-step execution wiring (advance steps, annotate progress events).
+- [x] Add rolling summary updates after each turn/tool result (changes, decisions, open questions, next step).
+- [x] Integrate summary-based context replacement when near token limits (keep system + summary + last exchange).
+- [x] Expose summary/plan metadata in stream events for UI and debugging.
+- [x] Add tests for plan generation, summary updates, and context replacement behavior.

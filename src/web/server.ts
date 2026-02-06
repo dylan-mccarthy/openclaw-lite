@@ -11,10 +11,10 @@ import { AgentIntegration } from '../agent/agent-integration.js';
 import { RunQueue } from '../agent/run-queue.js';
 import { MemoryIntegration } from '../agent/memory-integration.js';
 import { MemoryStreamingAgent } from '../agent/memory-streaming-agent.js';
+import { buildLiteSystemPrompt } from '../agent/system-prompt-lite.js';
 import { getConfigManager, initializeConfigSync } from '../config/openclaw-lite-config.js';
 import { createDefaultBasicPrompt } from '../agent/basic-prompt.js';
-import { PersonalityUpdater } from '../identity/personality-updater.js';
-import { UserInfoUpdater } from '../identity/user-info-updater.js';
+import { IdentityUpdater } from '../identity/identity-updater.js';
 import type { Message } from '../context/types.js';
 import type { AgentHookContext } from '../agent/hooks.js';
 import type { ToolExecutionResult } from '../agent/types.js';
@@ -39,8 +39,7 @@ export class WebServer {
   private fileLoader: FileLoader;
   private toolManager: ToolManager;
   private memoryManager: MemoryManager | null = null;
-  private personalityUpdater: PersonalityUpdater | null = null;
-  private userInfoUpdater: UserInfoUpdater | null = null;
+  private identityUpdater: IdentityUpdater | null = null;
   private options: Required<WebServerOptions>;
   private systemPrompt: string = '';
   private pendingApprovals: Map<string, { call: ToolCall; resolve: (approved: boolean) => void }> = new Map();
@@ -114,20 +113,12 @@ export class WebServer {
       console.warn('Failed to initialize memory manager:', error);
     }
     
-    // Initialize personality updater
+    // Initialize identity updater (SOUL.md, USER.md, IDENTITY.md)
     try {
-      this.personalityUpdater = new PersonalityUpdater(workspacePath);
-      console.log('🧠 Personality updater initialized');
+      this.identityUpdater = new IdentityUpdater(workspacePath, this.integration);
+      console.log('🧠 Identity updater initialized');
     } catch (error) {
-      console.warn('Failed to initialize personality updater:', error);
-    }
-    
-    // Initialize user info updater
-    try {
-      this.userInfoUpdater = new UserInfoUpdater(workspacePath);
-      console.log('👤 User info updater initialized');
-    } catch (error) {
-      console.warn('Failed to initialize user info updater:', error);
+      console.warn('Failed to initialize identity updater:', error);
     }
     
     // Initialize tool manager
@@ -1184,13 +1175,13 @@ export class WebServer {
         console.log(`[WEB] Result response length: ${result.response.length}`);
         console.log(`[WEB] Result has thinking tags: ${result.response.includes('<think>')}`);
         
-        // Log conversation for personality analysis
-        if (this.personalityUpdater) {
+        // Log conversation for identity analysis
+        if (this.identityUpdater) {
           try {
-            this.personalityUpdater.logConversation(message, result.response);
-            console.log(`🧠 Conversation logged for personality analysis`);
+            this.identityUpdater.logConversation(message, result.response);
+            console.log(`🧠 Conversation logged for identity analysis`);
           } catch (error) {
-            console.warn('Failed to log conversation for personality analysis:', error);
+            console.warn('Failed to log conversation for identity analysis:', error);
           }
         }
         
@@ -2092,17 +2083,17 @@ export class WebServer {
       }
     });
     
-    // Personality updater endpoints
+    // Identity updater endpoints
     this.app.get('/api/personality/traits', async (req, res) => {
       console.log(`[WEB] /api/personality/traits received request`);
       
-      if (!this.personalityUpdater) {
-        res.status(500).json({ error: 'Personality updater not available' });
+      if (!this.identityUpdater) {
+        res.status(500).json({ error: 'Identity updater not available' });
         return;
       }
       
       try {
-        const traits = this.personalityUpdater.getCurrentPersonality();
+        const traits = this.identityUpdater.getCurrentPersonality();
         
         res.json({
           success: true,
@@ -2123,17 +2114,18 @@ export class WebServer {
     this.app.post('/api/personality/update', async (req, res) => {
       console.log(`[WEB] /api/personality/update received request`);
       
-      if (!this.personalityUpdater) {
-        res.status(500).json({ error: 'Personality updater not available' });
+      if (!this.identityUpdater) {
+        res.status(500).json({ error: 'Identity updater not available' });
         return;
       }
       
       try {
-        this.personalityUpdater.manualUpdate();
+        const result = await this.identityUpdater.manualUpdate();
         
         res.json({
           success: true,
-          message: 'Personality analysis triggered',
+          message: result.summary,
+          updated: result,
           timestamp: new Date().toISOString(),
         });
         
@@ -2149,13 +2141,13 @@ export class WebServer {
     this.app.post('/api/personality/clear', async (req, res) => {
       console.log(`[WEB] /api/personality/clear received request`);
       
-      if (!this.personalityUpdater) {
-        res.status(500).json({ error: 'Personality updater not available' });
+      if (!this.identityUpdater) {
+        res.status(500).json({ error: 'Identity updater not available' });
         return;
       }
       
       try {
-        this.personalityUpdater.clearConversationLog();
+        this.identityUpdater.clearConversationLog();
         
         res.json({
           success: true,
@@ -2167,6 +2159,82 @@ export class WebServer {
         console.error(`[WEB] Error clearing conversation log:`, error);
         res.status(500).json({ 
           error: 'Failed to clear conversation log',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.get('/api/identity/summary', async (_req, res) => {
+      console.log(`[WEB] /api/identity/summary received request`);
+
+      if (!this.identityUpdater) {
+        res.status(500).json({ error: 'Identity updater not available' });
+        return;
+      }
+
+      try {
+        res.json({
+          success: true,
+          personalityTraits: this.identityUpdater.getCurrentPersonality(),
+          userSummary: this.identityUpdater.getCurrentUserSummary(),
+          identitySummary: this.identityUpdater.getCurrentIdentitySummary(),
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error(`[WEB] Error getting identity summary:`, error);
+        res.status(500).json({
+          error: 'Failed to get identity summary',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.post('/api/identity/update', async (_req, res) => {
+      console.log(`[WEB] /api/identity/update received request`);
+
+      if (!this.identityUpdater) {
+        res.status(500).json({ error: 'Identity updater not available' });
+        return;
+      }
+
+      try {
+        const result = await this.identityUpdater.manualUpdate();
+
+        res.json({
+          success: true,
+          updated: result,
+          message: result.summary,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error(`[WEB] Error updating identity:`, error);
+        res.status(500).json({
+          error: 'Failed to update identity',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    });
+
+    this.app.post('/api/identity/clear', async (_req, res) => {
+      console.log(`[WEB] /api/identity/clear received request`);
+
+      if (!this.identityUpdater) {
+        res.status(500).json({ error: 'Identity updater not available' });
+        return;
+      }
+
+      try {
+        this.identityUpdater.clearConversationLog();
+
+        res.json({
+          success: true,
+          message: 'Conversation log cleared',
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error(`[WEB] Error clearing identity log:`, error);
+        res.status(500).json({
+          error: 'Failed to clear identity log',
           details: error instanceof Error ? error.message : String(error)
         });
       }
@@ -2196,7 +2264,24 @@ export class WebServer {
     console.log('📚 Loading identity files...');
     
     try {
-      this.systemPrompt = await this.fileLoader.constructSystemPrompt();
+      const identityPrompt = await this.fileLoader.buildIdentityPrompt();
+      const toolSummaries = this.toolManager.listTools().map(tool => ({
+        name: tool.name,
+        summary: tool.description || `Use ${tool.name} tool`,
+      }));
+
+      this.systemPrompt = buildLiteSystemPrompt({
+        workspaceDir: this.workspacePath,
+        systemBase: identityPrompt,
+        toolSummaries,
+        runtimeInfo: {
+          model: this.options.model,
+          os: `${os.type()} ${os.release()}`,
+          node: process.version,
+        },
+        maxContextTokens: this.options.maxContextTokens,
+        reservedTokens: 1000,
+      });
       console.log('✅ Identity loaded from SOUL.md, USER.md, and memory files');
       console.log(`   System prompt length: ${this.systemPrompt.length}`);
       

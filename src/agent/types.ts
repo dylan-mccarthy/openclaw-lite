@@ -11,6 +11,8 @@ export interface AgentContext {
   systemPrompt: string;
   tools: ToolDefinition[];
   config: AgentConfig;
+  plan?: TaskPlan;
+  summary?: WorkingSummary;
 }
 
 export interface AgentConfig {
@@ -30,7 +32,8 @@ export interface AgentEvent {
   'tool_execution_start' | 'tool_update' | 'tool_result' | 'tool_error' |
         'thinking_start' | 'thinking_delta' | 'thinking_end' |
         'memory_search' | 'memory_save' |
-  'compaction' | 'error' | 'warning';
+  'compaction' | 'error' | 'warning' |
+  'plan_created' | 'plan_step' | 'summary_update' | 'context_replace';
   timestamp?: string;
   runId?: string;
   sessionId?: string;
@@ -59,6 +62,12 @@ export interface AgentEvent {
   compressedMessages?: number;
   compressionRatio?: number;
   compactionReason?: string;
+
+  // Planning event data
+  plan?: TaskPlan;
+  step?: TaskPlanStep;
+  summary?: WorkingSummary;
+  replaceReason?: string;
 }
 
 export interface ToolExecutionResult {
@@ -82,6 +91,8 @@ export interface AgentResult {
   startedAt?: number;
   endedAt?: number;
   status?: 'completed' | 'error' | 'aborted' | 'timeout';
+  plan?: TaskPlan;
+  summary?: WorkingSummary;
 }
 
 export interface AgentStreamOptions {
@@ -89,4 +100,25 @@ export interface AgentStreamOptions {
   signal?: AbortSignal;
   runId?: string;
   sessionId?: string;
+}
+
+export interface TaskPlanStep {
+  id: string;
+  title: string;
+  status: 'pending' | 'in_progress' | 'done';
+}
+
+export interface TaskPlan {
+  id: string;
+  createdAt: number;
+  summary: string;
+  steps: TaskPlanStep[];
+}
+
+export interface WorkingSummary {
+  updatedAt: number;
+  changes: string[];
+  decisions: string[];
+  openQuestions: string[];
+  nextStep?: string;
 }
