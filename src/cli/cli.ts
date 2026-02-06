@@ -490,6 +490,64 @@ program
     }
   });
 
+// Identity command
+program
+  .command('identity')
+  .description('Manage identity self-improvement (SOUL.md, USER.md, IDENTITY.md)')
+  .option('-u, --update', 'Run identity analysis and apply updates')
+  .option('-s, --summary', 'Show current identity summaries')
+  .option('-c, --clear-log', 'Clear conversation log used for identity updates')
+  .action(async (options) => {
+    try {
+      const configManager = await initializeConfig();
+      const config = configManager.getConfig();
+      const workspaceDir = configManager.getWorkspacePath();
+
+      const { OllamaIntegration } = await import('../ollama/integration.js');
+      const { IdentityUpdater } = await import('../identity/identity-updater.js');
+
+      const integration = new OllamaIntegration({
+        ollama: {
+          baseUrl: config.ollama.url,
+          model: config.ollama.defaultModel,
+        },
+        context: {
+          maxContextTokens: config.web.maxContextTokens,
+        },
+      });
+
+      const identityUpdater = new IdentityUpdater(workspaceDir, integration);
+
+      if (options.clearLog) {
+        identityUpdater.clearConversationLog();
+        console.log(chalk.green('✅ Conversation log cleared'));
+        return;
+      }
+
+      if (options.update) {
+        const result = await identityUpdater.manualUpdate();
+        console.log(chalk.green(`✅ ${result.summary}`));
+        return;
+      }
+
+      const personalityTraits = identityUpdater.getCurrentPersonality();
+      const userSummary = identityUpdater.getCurrentUserSummary();
+      const identitySummary = identityUpdater.getCurrentIdentitySummary();
+
+      console.log(chalk.bold('🧠 Identity Summary'));
+      console.log(chalk.gray('─'.repeat(60)));
+      console.log(chalk.cyan('Personality Traits:'));
+      console.log(personalityTraits.length > 0 ? personalityTraits.join(', ') : 'None');
+      console.log('\n' + chalk.cyan('USER.md:'));
+      console.log(userSummary);
+      console.log('\n' + chalk.cyan('IDENTITY.md:'));
+      console.log(identitySummary);
+    } catch (error) {
+      console.error(chalk.red('Failed to manage identity:'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
 // Config command
 program
   .command('config')

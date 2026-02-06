@@ -6,11 +6,13 @@
 
 import { PersonalityUpdater } from './personality-updater.js';
 import { UserMemoryAgent } from './user-memory-agent.js';
+import { IdentityMetadataUpdater } from './identity-metadata-updater.js';
 import type { OllamaIntegration } from '../ollama/integration.js';
 
 export class IdentityUpdater {
   private personalityUpdater: PersonalityUpdater;
   private userMemoryAgent: UserMemoryAgent;
+  private identityMetadataUpdater: IdentityMetadataUpdater;
   private analysisInterval: number = 10;
   private conversationCount: number = 0;
   
@@ -20,6 +22,7 @@ export class IdentityUpdater {
   ) {
     this.personalityUpdater = new PersonalityUpdater(workspaceDir);
     this.userMemoryAgent = new UserMemoryAgent(workspaceDir, ollamaIntegration);
+    this.identityMetadataUpdater = new IdentityMetadataUpdater(workspaceDir, ollamaIntegration);
   }
   
   /**
@@ -41,6 +44,7 @@ export class IdentityUpdater {
   async analyzeAndUpdate(): Promise<{
     personalityUpdated: boolean;
     userMemoryUpdated: boolean;
+    identityUpdated: boolean;
     summary: string;
   }> {
     console.log('🧠 Analyzing conversations for identity updates...');
@@ -48,6 +52,7 @@ export class IdentityUpdater {
     const results = {
       personalityUpdated: false,
       userMemoryUpdated: false,
+      identityUpdated: false,
       summary: ''
     };
     
@@ -59,11 +64,16 @@ export class IdentityUpdater {
       // Update user memory (USER.md) - asynchronous with agent
       const userUpdated = await this.userMemoryAgent.analyzeAndUpdate();
       results.userMemoryUpdated = userUpdated;
+
+      // Update identity metadata (IDENTITY.md) - asynchronous with agent
+      const identityUpdated = await this.identityMetadataUpdater.analyzeAndUpdate();
+      results.identityUpdated = identityUpdated;
       
       // Create summary
       const updates = [];
       if (results.personalityUpdated) updates.push('personality (SOUL.md)');
       if (results.userMemoryUpdated) updates.push('user memory (USER.md)');
+      if (results.identityUpdated) updates.push('identity metadata (IDENTITY.md)');
       
       if (updates.length > 0) {
         results.summary = `Updated ${updates.join(' and ')} based on recent conversations`;
@@ -94,6 +104,10 @@ export class IdentityUpdater {
   getCurrentUserSummary(): string {
     return this.userMemoryAgent.getCurrentUserSummary();
   }
+
+  getCurrentIdentitySummary(): string {
+    return this.identityMetadataUpdater.getCurrentIdentitySummary();
+  }
   
   /**
    * Manually trigger analysis
@@ -101,6 +115,7 @@ export class IdentityUpdater {
   async manualUpdate(): Promise<{
     personalityUpdated: boolean;
     userMemoryUpdated: boolean;
+    identityUpdated: boolean;
     summary: string;
   }> {
     console.log('🧠👤 Manually triggering identity analysis...');
