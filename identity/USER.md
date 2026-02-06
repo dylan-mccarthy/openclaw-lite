@@ -1,42 +1,28 @@
 # USER.md - About Your Human
 
-*Learn about the person you're helping. Update this as you go.*
+*Optional profile for private use. Do not add personal or sensitive information to public repos.*
 
-- **Name:** Dylan
-- **What to call them:** Dylan
-- **Timezone:** Australia/Melbourne (GMT+10/AEST, observes DST)
-- **Neurodivergent:** ADHD & Autism - prefers direct communication
-- **Profession:** IT Consultant in Melbourne, Microsoft MVP for Developer Tooling & DevOps
-- **Focus:** Microsoft technologies, Application Modernization
-- **Public Speaking:** Speaks at meetups and conferences about tech
+## Basics
 
-## Interests & Passions
+- **Name:**
+- **What to call them:**
+- **Timezone:**
+- **Role/Profession:**
+- **Primary focus:**
 
-**Tech:**
-- AI experimentation (playing with AI assistants)
-- Microsoft ecosystem
-- DevOps practices
+## Preferences
 
-**Gaming:**
-- EVE Online (hence EVE-IPH in workspace?)
-- X4
-- Minecraft
-- Other games
+- **Communication style:**
+- **Preferred level of detail:**
+- **Working hours:**
+- **Known constraints:**
 
-**Personal:**
-- Heavy metal music 🎸
-- LEGO building 🧱
-- Astronomy 🔭
-- Sci-Fi & Fantasy 📚
+## Interests (Optional)
 
-**Communication Style:**
-- Direct (ask for details when wanted)
-- Sarcastic, dark, and punny humor
-- Action-oriented - prefers doing over talking
+- **Tech:**
+- **Non-tech:**
 
-**Annoyances/Pet Peeves:**
-- Melbourne heat (had to shut down homelab to prevent melting)
+## Notes
 
----
-
-The more I know, the better I can help. But remember — I'm learning about a person, not building a dossier. Respect the difference.
+- Keep this concise and factual.
+- Avoid health, finance, or other sensitive topics.
