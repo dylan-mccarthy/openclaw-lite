@@ -1,4 +1,5 @@
 import express from 'express';
+import http from 'http';
 import cors from 'cors';
 import path from 'path';
 import os from 'os';
@@ -13,8 +14,17 @@ import { MemoryIntegration } from '../agent/memory-integration.js';
 import { MemoryStreamingAgent } from '../agent/memory-streaming-agent.js';
 import { buildLiteSystemPrompt } from '../agent/system-prompt-lite.js';
 import { getConfigManager, initializeConfigSync } from '../config/openclaw-lite-config.js';
+import type { OpenClawLiteConfig } from '../config/openclaw-lite-config.js';
 import { createDefaultBasicPrompt } from '../agent/basic-prompt.js';
 import { IdentityUpdater } from '../identity/identity-updater.js';
+import { GatewayControlPlane } from '../gateway/control-plane.js';
+import { SessionManager } from '../sessions/session-manager.js';
+import { APP_NAME, APP_VERSION } from '../version.js';
+import { TelegramIntegration } from '../telegram/telegram-integration.js';
+import type { TelegramUpdate } from '../telegram/telegram-client.js';
+import { CronStore, type CronJob } from '../cron/cron-store.js';
+import { CronScheduler } from '../cron/cron-scheduler.js';
+import { DeepLogger } from '../logging/deep-logger.js';
 import type { Message } from '../context/types.js';
 import type { AgentHookContext } from '../agent/hooks.js';
 import type { ToolExecutionResult } from '../agent/types.js';
@@ -47,6 +57,15 @@ export class WebServer {
   private workspacePath: string;
   private identityPath: string;
   private runQueue: RunQueue;
+  private gatewayControlPlane: GatewayControlPlane | null = null;
+  private httpServer: http.Server | null = null;
+  private sessionManager: SessionManager;
+  private telegramIntegration: TelegramIntegration | null = null;
+  private telegramConfig: OpenClawLiteConfig['telegram'];
+  private cronStore: CronStore;
+  private cronScheduler: CronScheduler | null = null;
+  private cronConfig: OpenClawLiteConfig['cron'];
+  private logger: DeepLogger;
   
   constructor(options: WebServerOptions = {}) {
     // Load default model from config
@@ -96,6 +115,24 @@ export class WebServer {
       memoryPath
     });
     console.log(`📁 Workspace: ${workspacePath}`);
+
+    this.sessionManager = new SessionManager({
+      storagePath: configManager.getConfigPath()
+    });
+
+    this.telegramConfig = config.telegram;
+    this.cronConfig = config.cron;
+    this.cronStore = new CronStore(configManager.getConfigPath());
+    this.logger = new DeepLogger(configManager.getLogsPath());
+    const telegramToken = process.env.TELEGRAM_BOT_TOKEN || config.telegram.botToken;
+
+    const gatewayToken = process.env.OPENCLAW_LITE_GATEWAY_TOKEN || config.gateway.authToken;
+    this.gatewayControlPlane = new GatewayControlPlane({
+      enabled: config.gateway.enabled,
+      wsPath: config.gateway.wsPath,
+      authToken: gatewayToken,
+      allowUnauthenticated: config.gateway.allowUnauthenticated,
+    });
     
     // Initialize memory manager if enabled
     try {
@@ -132,7 +169,9 @@ export class WebServer {
       requireApprovalForDangerous,
       disableApprovals: this.approvalsDisabled,
       maxLogSize: 1000,
-      configPath: configManager.getToolConfigPath()
+      configPath: configManager.getToolConfigPath(),
+      telegramBotToken: telegramToken,
+      logger: this.logger,
     });
     
     console.log('🔧 Tool system initialized');
@@ -179,6 +218,84 @@ export class WebServer {
     this.agentIntegration.registerHook('afterToolCall', (_context: AgentHookContext, execution: ToolExecutionResult) => {
       console.log(`[Hook] Tool ${execution.toolName} ${execution.success ? 'ok' : 'failed'}`);
     });
+    this.agentIntegration.registerHook('beforeAgentStart', (context: AgentHookContext) => {
+      this.gatewayControlPlane?.emitAgentEvent({
+        type: 'agent_start',
+        runId: context.runId,
+        sessionId: context.sessionId,
+        timestamp: new Date().toISOString(),
+      });
+      this.gatewayControlPlane?.setTyping(context.sessionId, true);
+    });
+    this.agentIntegration.registerHook('afterToolCall', (context: AgentHookContext, execution: ToolExecutionResult) => {
+      this.gatewayControlPlane?.emitAgentEvent({
+        type: 'tool_result',
+        runId: context.runId,
+        sessionId: context.sessionId,
+        toolCallId: execution.toolCallId,
+        toolName: execution.toolName,
+        result: execution.result,
+        error: execution.error,
+        duration: execution.duration,
+        timestamp: new Date().toISOString(),
+      });
+    });
+    this.agentIntegration.registerHook('afterAgentEnd', (context: AgentHookContext, result) => {
+      this.gatewayControlPlane?.setTyping(context.sessionId, false);
+      this.gatewayControlPlane?.emitAgentEvent({
+        type: 'agent_end',
+        runId: context.runId,
+        sessionId: context.sessionId,
+        duration: result.duration,
+        timestamp: new Date().toISOString(),
+      });
+      this.gatewayControlPlane?.emitUsageEvent({
+        runId: context.runId,
+        sessionId: context.sessionId,
+        model: context.config.model,
+        durationMs: result.duration,
+        toolCount: result.toolExecutions.length,
+        status: result.status,
+      });
+    });
+
+    if (config.telegram.enabled && telegramToken) {
+      this.telegramIntegration = new TelegramIntegration({
+        botToken: telegramToken,
+        botUsername: config.telegram.botUsername,
+        mode: config.telegram.mode,
+        pollingIntervalMs: config.telegram.pollingIntervalMs,
+        webhookUrl: config.telegram.webhookUrl,
+        webhookPath: config.telegram.webhookPath,
+        allowFrom: config.telegram.allowFrom,
+        groupAllowFrom: config.telegram.groupAllowFrom,
+        requireMentionInGroups: config.telegram.requireMentionInGroups,
+        pairingEnabled: config.telegram.pairingEnabled,
+        pairingCodeLength: config.telegram.pairingCodeLength,
+        pairingTtlMinutes: config.telegram.pairingTtlMinutes,
+        storagePath: configManager.getConfigPath(),
+        sessionManager: this.sessionManager,
+        agentIntegration: this.agentIntegration,
+        getSystemPrompt: () => this.systemPrompt,
+        getModel: () => this.options.model,
+      });
+    } else if (config.telegram.enabled) {
+      console.warn('⚠️  Telegram enabled but no bot token configured');
+    }
+
+    if (config.cron.enabled) {
+      this.cronScheduler = new CronScheduler({
+        store: this.cronStore,
+        onRun: async (job) => {
+          if (!this.agentIntegration) {
+            throw new Error('Agent integration unavailable');
+          }
+          const sessionId = job.sessionId || 'main';
+          await this.agentIntegration.run(job.message, this.systemPrompt, { sessionId });
+        },
+        logger: this.logger,
+      });
+    }
     
     // Initialize memory streaming agent (Phase 3)
     if (this.agentIntegration.getAgentLoop() && this.agentIntegration.getToolBridge()) {
@@ -898,8 +1015,8 @@ export class WebServer {
         `);
       } else {
         res.json({
-          name: 'OpenClaw Lite Web Server',
-          version: '0.1.0',
+          name: APP_NAME,
+          version: APP_VERSION,
           endpoints: {
             chat: 'POST /api/chat',
             health: 'GET /api/health',
@@ -930,6 +1047,10 @@ export class WebServer {
         
         return res.json({
           status: 'ok',
+          app: {
+            name: APP_NAME,
+            version: APP_VERSION,
+          },
           ollama: health.ollama,
           model: this.options.model,
           models: health.models.length,
@@ -937,6 +1058,19 @@ export class WebServer {
           tools: {
             enabled: true,
             count: this.toolManager.listTools().length
+          },
+          gateway: this.gatewayControlPlane?.getStatus() ?? { enabled: false },
+          telegram: {
+            enabled: this.telegramConfig.enabled,
+            mode: this.telegramConfig.mode,
+            webhookPath: this.telegramConfig.webhookPath,
+          },
+          cron: {
+            enabled: this.cronConfig.enabled,
+            jobs: this.cronStore.listJobs().length,
+          },
+          logs: {
+            enabled: true,
           },
           endpoints: {
             chat: 'POST /api/chat',
@@ -958,6 +1092,133 @@ export class WebServer {
         });
       }
     });
+
+    this.app.get('/api/logs/recent', (req, res) => {
+      const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 200;
+      res.json({ entries: this.logger.readRecent(limit) });
+    });
+
+    this.app.get('/api/logs/export', (req, res) => {
+      const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 2000;
+      res.json(this.logger.exportBundle(limit));
+    });
+
+    this.app.get('/api/cron/jobs', (_req, res) => {
+      res.json({ jobs: this.cronStore.listJobs() });
+    });
+
+    this.app.get('/api/cron/runs', (req, res) => {
+      const jobId = typeof req.query.jobId === 'string' ? req.query.jobId : undefined;
+      res.json({ runs: this.cronStore.listRuns(jobId, this.cronConfig.runHistoryLimit) });
+    });
+
+    this.app.post('/api/cron/jobs', (req, res) => {
+      const { name, schedule, message, sessionId, enabled = true } = req.body;
+
+      if (!name || !schedule || !message) {
+        res.status(400).json({ error: 'name, schedule, and message are required' });
+        return;
+      }
+
+      const job = this.cronStore.addJob({
+        name,
+        schedule,
+        message,
+        sessionId,
+        enabled,
+      } as Omit<CronJob, 'id' | 'createdAt' | 'updatedAt'>);
+
+      if (this.cronScheduler) {
+        this.cronScheduler.reschedule(job);
+      }
+
+      res.json({ job });
+    });
+
+    this.app.put('/api/cron/jobs/:id', (req, res) => {
+      const { id } = req.params;
+      const updates = req.body as Partial<CronJob>;
+
+      const job = this.cronStore.updateJob(id, updates);
+      if (!job) {
+        res.status(404).json({ error: 'Job not found' });
+        return;
+      }
+
+      if (this.cronScheduler) {
+        this.cronScheduler.reschedule(job);
+      }
+
+      res.json({ job });
+    });
+
+    this.app.delete('/api/cron/jobs/:id', (req, res) => {
+      const { id } = req.params;
+      const deleted = this.cronStore.deleteJob(id);
+      if (!deleted) {
+        res.status(404).json({ error: 'Job not found' });
+        return;
+      }
+      res.json({ success: true });
+    });
+
+    this.app.post('/api/cron/jobs/:id/trigger', async (req, res) => {
+      const { id } = req.params;
+      const job = this.cronStore.getJob(id);
+      if (!job) {
+        res.status(404).json({ error: 'Job not found' });
+        return;
+      }
+
+      if (!this.cronScheduler) {
+        res.status(400).json({ error: 'Cron scheduler disabled' });
+        return;
+      }
+
+      await this.cronScheduler.triggerNow(job);
+      res.json({ success: true });
+    });
+
+    if (this.telegramIntegration && this.telegramConfig.webhookPath) {
+      this.app.post(this.telegramConfig.webhookPath, async (req, res) => {
+        const update = req.body as TelegramUpdate;
+        try {
+          await this.telegramIntegration?.handleWebhook(update);
+          res.json({ ok: true });
+        } catch (error) {
+          console.error('[WEB] Telegram webhook error:', error);
+          res.status(500).json({ ok: false });
+        }
+      });
+
+      this.app.get('/api/telegram/pairing/pending', (_req, res) => {
+        if (!this.telegramIntegration) {
+          res.status(400).json({ error: 'Telegram not configured' });
+          return;
+        }
+        res.json({ pending: this.telegramIntegration.getPairingStore().listPending() });
+      });
+
+      this.app.post('/api/telegram/pairing/approve', (req, res) => {
+        if (!this.telegramIntegration) {
+          res.status(400).json({ error: 'Telegram not configured' });
+          return;
+        }
+        const { code } = req.body as { code?: string };
+        if (!code) {
+          res.status(400).json({ error: 'Pairing code is required' });
+          return;
+        }
+
+        const chatId = this.telegramIntegration.getPairingStore().approvePairing(code);
+        if (!chatId) {
+          res.status(404).json({ error: 'Pairing code not found' });
+          return;
+        }
+
+        res.json({ success: true, chatId });
+      });
+    }
     
     // List models
     this.app.get('/api/models', async (_req, res) => {
@@ -1121,17 +1382,27 @@ export class WebServer {
       }
       
       try {
+        this.logger.logEvent('chat_request', {
+          sessionId: clientSessionId || 'main',
+          messageLength: message.length,
+          model: model || this.options.model,
+        });
         // Determine session ID
         let sessionId = clientSessionId;
         let isNewSession = false;
         
-        if (!sessionId || createNew) {
-          // Generate new session ID
-          sessionId = this.memoryManager ? 
-            this.memoryManager.generateSessionId() : 
-            `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+        if (createNew) {
+          sessionId = this.sessionManager.createSession({ type: 'main', source: 'web-ui' }).sessionId;
           isNewSession = true;
           console.log(`💾 Created new web session: ${sessionId}`);
+        } else {
+          const session = this.sessionManager.getOrCreateSession({
+            sessionId: sessionId,
+            type: 'main',
+            source: 'web-ui',
+          });
+          sessionId = session.sessionId;
+          isNewSession = sessionId === 'main' && !clientSessionId;
         }
         
         // Load session messages from memory or start fresh
@@ -1227,6 +1498,13 @@ export class WebServer {
         console.log(`[WEB] Sending response, total size: ${JSON.stringify(responseData).length} bytes`);
         console.log(`[WEB] Response preview: ${result.response.substring(0, 100).replace(/\n/g, '\\n')}...`);
         
+        this.logger.logEvent('chat_response', {
+          sessionId,
+          responseLength: result.response.length,
+          model: result.modelUsed,
+          durationMs: responseTime,
+        });
+
         // Send response
         return res.json(responseData);
         
@@ -1421,8 +1699,14 @@ export class WebServer {
       }
       
       try {
+        const resolvedSession = this.sessionManager.getOrCreateSession({
+          sessionId: sessionId,
+          type: 'main',
+          source: 'web-ui',
+        });
+
         const result = await this.toolManager.callTool(tool, args, {
-          sessionId: sessionId || `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+          sessionId: resolvedSession.sessionId,
           workspacePath: this.toolManager['options'].workspacePath,
           requireApproval: async (call: ToolCall) => {
             if (this.approvalsDisabled) {
@@ -1605,12 +1889,18 @@ export class WebServer {
         let sessionId = clientSessionId;
         let isNewSession = false;
         
-        if (!sessionId || createNew) {
-          sessionId = this.memoryManager ? 
-            this.memoryManager.generateSessionId() : 
-            `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+        if (createNew) {
+          sessionId = this.sessionManager.createSession({ type: 'main', source: 'web-ui' }).sessionId;
           isNewSession = true;
           console.log(`[WEB] Created new web session: ${sessionId}`);
+        } else {
+          const session = this.sessionManager.getOrCreateSession({
+            sessionId: sessionId,
+            type: 'main',
+            source: 'web-ui',
+          });
+          sessionId = session.sessionId;
+          isNewSession = sessionId === 'main' && !clientSessionId;
         }
         
         // Load session messages from memory or start fresh
@@ -1721,12 +2011,22 @@ export class WebServer {
       }
       
       try {
+        this.logger.logEvent('agent_run_start', {
+          sessionId: clientSessionId || 'main',
+          messageLength: message.length,
+          model: model || this.options.model,
+        });
         const startTime = Date.now();
         console.log(`[WEB] Starting agent loop...`);
         
         // Use client system prompt or default
         const systemPrompt = clientSystemPrompt || this.systemPrompt;
-        const sessionId = clientSessionId || (this.memoryManager?.generateSessionId() ?? `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
+        const session = this.sessionManager.getOrCreateSession({
+          sessionId: clientSessionId,
+          type: 'main',
+          source: 'web-ui',
+        });
+        const sessionId = session.sessionId;
         
         // Run agent
         const result = await this.agentIntegration.run(
@@ -1771,6 +2071,13 @@ export class WebServer {
           },
         };
         
+        this.logger.logEvent('agent_run_end', {
+          sessionId,
+          durationMs: responseTime,
+          toolCount: result.toolExecutions.length,
+          status: result.status,
+        });
+
         res.json(responseData);
       } catch (error) {
         console.error(`[WEB] Error in /api/agent/run:`, error);
@@ -1805,7 +2112,12 @@ export class WebServer {
         'X-Accel-Buffering': 'no',
       });
       
-      const sessionId = clientSessionId || (this.memoryManager?.generateSessionId() ?? `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
+      const session = this.sessionManager.getOrCreateSession({
+        sessionId: clientSessionId,
+        type: 'main',
+        source: 'web-ui',
+      });
+      const sessionId = session.sessionId;
       const runId = clientRunId || this.runQueue.createRunId();
 
       // Send initial connection event
@@ -2387,10 +2699,25 @@ You are a helpful AI assistant running in OpenClaw Lite.
         process.exit(1);
       }
     }
+
+      if (this.telegramIntegration) {
+        await this.telegramIntegration.start();
+        console.log(`📨 Telegram integration started (${this.telegramConfig.mode})`);
+      }
+
+      if (this.cronScheduler) {
+        this.cronScheduler.start();
+        console.log('⏰ Cron scheduler started');
+      }
     
     // Start server
     return new Promise<void>((resolve) => {
-      this.app.listen(this.options.port, '0.0.0.0', () => {
+      this.httpServer = http.createServer(this.app);
+      if (this.gatewayControlPlane?.isEnabled()) {
+        this.gatewayControlPlane.attach(this.httpServer);
+      }
+
+      this.httpServer.listen(this.options.port, '0.0.0.0', () => {
         console.log('\n🚀 OpenClaw Lite Web Server');
         console.log('─'.repeat(40));
         console.log(`📡 Local: http://localhost:${this.options.port}`);
@@ -2424,6 +2751,10 @@ You are a helpful AI assistant running in OpenClaw Lite.
         console.log(`   GET  /api/health    - Health check`);
         console.log(`   GET  /api/models    - List models`);
         console.log(`   POST /api/model     - Change model`);
+        if (this.gatewayControlPlane?.isEnabled()) {
+          const status = this.gatewayControlPlane.getStatus();
+          console.log(`   WS   ${status.wsPath}   - Gateway control plane`);
+        }
         console.log('\n💡 Press Ctrl+C to stop');
         console.log('─'.repeat(40));
         
@@ -2441,6 +2772,23 @@ You are a helpful AI assistant running in OpenClaw Lite.
     // Cleanup if needed
     if (this.memoryManager) {
       // Any memory cleanup if needed
+    }
+
+    if (this.telegramIntegration) {
+      this.telegramIntegration.stop();
+    }
+
+    if (this.cronScheduler) {
+      this.cronScheduler.stop();
+    }
+
+    if (this.gatewayControlPlane) {
+      this.gatewayControlPlane.close();
+    }
+
+    if (this.httpServer) {
+      this.httpServer.close();
+      this.httpServer = null;
     }
   }
   

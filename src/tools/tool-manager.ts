@@ -2,6 +2,8 @@ import fs from 'fs/promises';
 import path from 'path';
 import { exec as childProcessExec } from 'child_process';
 import { promisify } from 'util';
+import { TelegramClient } from '../telegram/telegram-client.js';
+import type { DeepLogger } from '../logging/deep-logger.js';
 import type {
   ToolDefinition,
   ToolHandler,
@@ -21,6 +23,8 @@ export class ToolManager implements ToolRegistry {
   private configManager: ToolConfigManager;
   private identityRelativePath: string | null;
   private memoryRelativePath: string | null;
+  private telegramClient: TelegramClient | null = null;
+  private logger?: DeepLogger;
 
   constructor(private options: {
     workspacePath: string;
@@ -30,6 +34,8 @@ export class ToolManager implements ToolRegistry {
     disableApprovals?: boolean;
     maxLogSize?: number;
     configPath?: string;
+    telegramBotToken?: string;
+    logger?: DeepLogger;
   }) {
     const configPath = options.configPath || path.join(process.env.HOME || '.', '.openclaw-lite', 'config', 'tool-config.json');
     this.configManager = new ToolConfigManager({
@@ -39,6 +45,12 @@ export class ToolManager implements ToolRegistry {
 
     this.identityRelativePath = this.getRelativePath(options.identityPath, options.workspacePath);
     this.memoryRelativePath = this.getRelativePath(options.memoryPath, options.workspacePath);
+
+    if (options.telegramBotToken) {
+      this.telegramClient = new TelegramClient({ botToken: options.telegramBotToken });
+    }
+
+    this.logger = options.logger;
     
     this.registerDefaultTools();
   }
@@ -127,6 +139,15 @@ export class ToolManager implements ToolRegistry {
         approved: true
       });
 
+      this.logger?.logEvent('tool_result', {
+        tool: name,
+        success: toolResult.success,
+        duration: toolResult.duration,
+        sessionId: context.sessionId,
+        args,
+        result: toolResult.result,
+      });
+
       return toolResult;
 
     } catch (error) {
@@ -144,6 +165,14 @@ export class ToolManager implements ToolRegistry {
         call,
         result: toolResult,
         approved: true
+      });
+
+      this.logger?.logEvent('tool_error', {
+        tool: name,
+        error: toolResult.error,
+        duration: toolResult.duration,
+        sessionId: context.sessionId,
+        args,
       });
 
       return toolResult;
@@ -627,6 +656,61 @@ export class ToolManager implements ToolRegistry {
       }
     }, this.handleHttpRequest.bind(this));
 
+    if (this.telegramClient) {
+      this.registerTool({
+        name: 'telegram_send',
+        description: 'Send a Telegram message to a chat ID',
+        category: 'network',
+        dangerous: true,
+        requiresApproval: true,
+        parameters: {
+          chatId: {
+            type: 'string',
+            description: 'Telegram chat ID (numeric, passed as string)',
+            required: true
+          },
+          text: {
+            type: 'string',
+            description: 'Message text to send',
+            required: true
+          }
+        },
+        returns: {
+          type: 'object',
+          description: 'Telegram send result'
+        }
+      }, this.handleTelegramSend.bind(this));
+
+      this.registerTool({
+        name: 'telegram_reply',
+        description: 'Reply to a Telegram message ID in a chat',
+        category: 'network',
+        dangerous: true,
+        requiresApproval: true,
+        parameters: {
+          chatId: {
+            type: 'string',
+            description: 'Telegram chat ID (numeric, passed as string)',
+            required: true
+          },
+          messageId: {
+            type: 'number',
+            description: 'Message ID to reply to',
+            required: true
+          },
+          text: {
+            type: 'string',
+            description: 'Reply text to send',
+            required: true
+          }
+        },
+        returns: {
+          type: 'object',
+          description: 'Telegram reply result'
+        }
+      }, this.handleTelegramReply.bind(this));
+    }
+
     // Create script tool
     this.registerTool({
       name: 'create_script',
@@ -1068,6 +1152,37 @@ export class ToolManager implements ToolRegistry {
     } catch (error: any) {
       throw new Error(`HTTP request failed: ${error.message}`);
     }
+  }
+
+  private async handleTelegramSend(args: Record<string, any>, _context: ToolContext): Promise<any> {
+    if (!this.telegramClient) {
+      throw new Error('Telegram client not configured');
+    }
+
+    const chatId = String(args.chatId || '').trim();
+    const text = String(args.text || '').trim();
+
+    if (!chatId || !text) {
+      throw new Error('chatId and text are required');
+    }
+
+    return this.telegramClient.sendMessage(chatId, text);
+  }
+
+  private async handleTelegramReply(args: Record<string, any>, _context: ToolContext): Promise<any> {
+    if (!this.telegramClient) {
+      throw new Error('Telegram client not configured');
+    }
+
+    const chatId = String(args.chatId || '').trim();
+    const text = String(args.text || '').trim();
+    const messageId = Number.parseInt(String(args.messageId), 10);
+
+    if (!chatId || !text || Number.isNaN(messageId)) {
+      throw new Error('chatId, messageId, and text are required');
+    }
+
+    return this.telegramClient.sendMessage(chatId, text, messageId);
   }
 
   private async handleCreateScript(args: Record<string, any>, context: ToolContext): Promise<void> {

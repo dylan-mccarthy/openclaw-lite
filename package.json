@@ -33,18 +33,21 @@
     "chalk": "^5.6.2",
     "commander": "^12.1.0",
     "cors": "^2.8.6",
+    "cron-parser": "^4.9.0",
     "express": "^5.2.1",
     "node-fetch": "^2.7.0",
     "ora": "^7.0.1",
+    "ws": "^8.18.1",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^22.19.7",
+    "@types/ws": "^8.5.12",
     "oxc-transform": "^0.15.0",
     "oxlint": "^0.15.0",
     "typescript": "^5.7.3",
-    "vitest": "^2.1.8"
+    "vitest": "^4.0.18"
   }
 }
