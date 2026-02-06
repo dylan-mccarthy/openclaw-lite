@@ -27,7 +27,7 @@ export class MemoryStreamingAgent extends SteeringStreamingAgent {
   async runWithMemory(
     prompt: string,
     systemPrompt: string = '',
-    onEvent?: (event: AgentEvent) => void
+    options?: AgentStreamOptions
   ): Promise<{
     response: string;
     events: AgentEvent[];
@@ -45,13 +45,15 @@ export class MemoryStreamingAgent extends SteeringStreamingAgent {
     let memorySessionsFound = 0;
     
     const eventHandler = (event: AgentEvent) => {
-      events.push(event);
-      onEvent?.(event);
+      const stampedEvent = {
+        ...event,
+        timestamp: event.timestamp || new Date().toISOString(),
+        runId: event.runId || options?.runId,
+        sessionId: event.sessionId || options?.sessionId,
+      };
+      events.push(stampedEvent);
+      options?.onEvent?.(stampedEvent);
     };
-    
-    // Start events
-    eventHandler({ type: 'agent_start' });
-    eventHandler({ type: 'turn_start' });
     
     try {
       // Search memory if enabled
@@ -83,8 +85,11 @@ export class MemoryStreamingAgent extends SteeringStreamingAgent {
       const result = await this.runWithSteering(
         prompt,
         enhancedSystemPrompt,
-        (event) => {
-          eventHandler(event);
+        {
+          ...options,
+          onEvent: (event) => {
+            eventHandler(event);
+          }
         }
       );
       
@@ -177,15 +182,6 @@ export class MemoryStreamingAgent extends SteeringStreamingAgent {
           });
         }
       }
-      
-      eventHandler({ 
-        type: 'agent_end',
-        message: { 
-          role: 'assistant', 
-          content: result.response,
-          timestamp: new Date()
-        } 
-      });
       
       return {
         response: result.response,

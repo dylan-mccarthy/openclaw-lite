@@ -6,6 +6,7 @@ import type {
 import type { Message } from '../context/types.js';
 import { AgentLoop } from './agent-loop.js';
 import type { ToolBridge } from './tool-bridge.js';
+import { EventStream } from './event-stream.js';
 
 /**
  * Streaming agent that emits events in real-time
@@ -28,48 +29,37 @@ export class StreamingAgent {
     options?: AgentStreamOptions
   ): AsyncGenerator<AgentEvent> {
     console.log(`[StreamingAgent] Starting streaming execution for: "${prompt.substring(0, 100)}..."`);
-    
-    // Create event handler that yields events
-    const eventHandler = (event: AgentEvent) => {
-      // This will be called by AgentLoop
-      // We'll handle it via the stream callback
-    };
-    
-    // We need to modify AgentLoop to support streaming callbacks
-    // For now, use a simple wrapper
-    
-    try {
-      // Yield start event
-      yield { type: 'agent_start' };
-      yield { type: 'turn_start' };
-      
-      // For Phase 2, we'll implement proper streaming
-      // For now, run synchronously and yield events
-      const result = await this.agentLoop.run(
-        prompt,
-        systemPrompt,
-        tools,
-        {
-          ...options,
-          onEvent: (event) => {
-            // This would be called in real-time
-            // We'll implement this properly in the next step
-          }
+
+    const stream = EventStream.createAgentStream();
+    let runError: unknown;
+
+    const runPromise = this.agentLoop.run(
+      prompt,
+      systemPrompt,
+      tools,
+      {
+        ...options,
+        onEvent: (event) => {
+          const stampedEvent = {
+            ...event,
+            timestamp: event.timestamp || new Date().toISOString(),
+          };
+          stream.push(stampedEvent);
+          options?.onEvent?.(stampedEvent);
         }
-      );
-      
-      // Yield completion event
-      yield { 
-        type: 'agent_end',
-        message: result.messages[result.messages.length - 1]
-      };
-      
-    } catch (error) {
-      yield {
-        type: 'error',
-        error: error instanceof Error ? error.message : String(error)
-      };
-      throw error;
+      }
+    ).catch((error) => {
+      runError = error;
+    });
+
+    for await (const event of stream) {
+      yield event;
+    }
+
+    await runPromise;
+
+    if (runError) {
+      throw runError;
     }
   }
   
@@ -99,7 +89,7 @@ export class StreamingAgent {
   async runWithStreaming(
     prompt: string,
     systemPrompt: string = '',
-    onEvent?: (event: AgentEvent) => void
+    options?: AgentStreamOptions
   ): Promise<{
     response: string;
     events: AgentEvent[];
@@ -108,25 +98,19 @@ export class StreamingAgent {
     
     const eventHandler = (event: AgentEvent) => {
       events.push(event);
-      onEvent?.(event);
+      options?.onEvent?.(event);
     };
-    
-    // Start with agent events
-    eventHandler({ type: 'agent_start' });
-    eventHandler({ type: 'turn_start' });
     
     try {
       const result = await this.agentLoop.run(
         prompt,
         systemPrompt,
         undefined, // Get tools from ToolBridge
-        { onEvent: eventHandler }
+        {
+          ...options,
+          onEvent: eventHandler,
+        }
       );
-      
-      eventHandler({ 
-        type: 'agent_end',
-        message: result.messages[result.messages.length - 1]
-      });
       
       return {
         response: result.response,

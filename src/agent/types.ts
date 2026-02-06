@@ -27,10 +27,13 @@ export interface AgentEvent {
   type: 'agent_start' | 'agent_end' | 
         'turn_start' | 'turn_end' |
         'message_start' | 'message_end' | 'message_update' |
-        'tool_execution_start' | 'tool_result' | 'tool_error' |
+  'tool_execution_start' | 'tool_update' | 'tool_result' | 'tool_error' |
         'thinking_start' | 'thinking_delta' | 'thinking_end' |
         'memory_search' | 'memory_save' |
-        'error' | 'warning';
+  'compaction' | 'error' | 'warning';
+  timestamp?: string;
+  runId?: string;
+  sessionId?: string;
   
   // Event-specific data
   message?: Message;
@@ -46,11 +49,16 @@ export interface AgentEvent {
   query?: string;
   sessionsFound?: number;
   contextLength?: number;
-  sessionId?: string;
   wouldSave?: boolean;
   saved?: boolean;
   messageCount?: number;
   toolCount?: number;
+
+  // Compaction event data
+  originalMessages?: number;
+  compressedMessages?: number;
+  compressionRatio?: number;
+  compactionReason?: string;
 }
 
 export interface ToolExecutionResult {
@@ -69,9 +77,16 @@ export interface AgentResult {
   messages: Message[];
   turns: number;
   duration: number;
+  runId?: string;
+  sessionId?: string;
+  startedAt?: number;
+  endedAt?: number;
+  status?: 'completed' | 'error' | 'aborted' | 'timeout';
 }
 
 export interface AgentStreamOptions {
   onEvent?: (event: AgentEvent) => void;
   signal?: AbortSignal;
+  runId?: string;
+  sessionId?: string;
 }

@@ -8,6 +8,7 @@ import { MemoryManager } from '../memory/memory-manager.js';
 import { ToolManager } from '../tools/tool-manager.js';
 import { OpenClawToolIntegration } from '../tools/openclaw-tool-integration.js';
 import { AgentIntegration } from '../agent/agent-integration.js';
+import { RunQueue } from '../agent/run-queue.js';
 import { MemoryIntegration } from '../agent/memory-integration.js';
 import { MemoryStreamingAgent } from '../agent/memory-streaming-agent.js';
 import { getConfigManager, initializeConfigSync } from '../config/openclaw-lite-config.js';
@@ -15,6 +16,8 @@ import { createDefaultBasicPrompt } from '../agent/basic-prompt.js';
 import { PersonalityUpdater } from '../identity/personality-updater.js';
 import { UserInfoUpdater } from '../identity/user-info-updater.js';
 import type { Message } from '../context/types.js';
+import type { AgentHookContext } from '../agent/hooks.js';
+import type { ToolExecutionResult } from '../agent/types.js';
 import type { ToolCall, ToolUsageLog } from '../tools/types.js';
 
 export interface WebServerOptions {
@@ -44,6 +47,7 @@ export class WebServer {
   private approvalsDisabled: boolean = false;
   private workspacePath: string;
   private identityPath: string;
+  private runQueue: RunQueue;
   
   constructor(options: WebServerOptions = {}) {
     // Load default model from config
@@ -86,6 +90,7 @@ export class WebServer {
     const memoryPath = configManager.getMemoryPath();
     this.workspacePath = workspacePath;
     this.identityPath = identityPath;
+    this.runQueue = new RunQueue();
     this.fileLoader = new FileLoader({
       workspacePath,
       identityPath,
@@ -171,8 +176,18 @@ export class WebServer {
       baseUrl: this.options.ollamaUrl,
       workspacePath: process.cwd(),
       sessionId: 'web-server',
+      runQueue: this.runQueue,
     });
     console.log('🤖 Agent integration enabled (Phase 1)');
+
+    this.agentIntegration.registerHook('beforeAgentStart', (context: AgentHookContext) => {
+      return {
+        systemPrompt: `${context.systemPrompt}\n\n## Runtime Note\n- Web server hook active (example)`
+      };
+    });
+    this.agentIntegration.registerHook('afterToolCall', (_context: AgentHookContext, execution: ToolExecutionResult) => {
+      console.log(`[Hook] Tool ${execution.toolName} ${execution.success ? 'ok' : 'failed'}`);
+    });
     
     // Initialize memory streaming agent (Phase 3)
     if (this.agentIntegration.getAgentLoop() && this.agentIntegration.getToolBridge()) {
@@ -1699,7 +1714,7 @@ export class WebServer {
     // Phase 1: Agent loop endpoint
     this.app.post('/api/agent/run', async (req, res) => {
       console.log(`[WEB] /api/agent/run received request`);
-      const { message, systemPrompt: clientSystemPrompt, model } = req.body;
+      const { message, systemPrompt: clientSystemPrompt, model, sessionId: clientSessionId, runId: clientRunId } = req.body;
       
       console.log(`[WEB] Agent request: message="${message?.substring(0, 50)}...", model=${model || 'default'}`);
       
@@ -1720,11 +1735,16 @@ export class WebServer {
         
         // Use client system prompt or default
         const systemPrompt = clientSystemPrompt || this.systemPrompt;
+        const sessionId = clientSessionId || (this.memoryManager?.generateSessionId() ?? `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
         
         // Run agent
         const result = await this.agentIntegration.run(
           message,
-          systemPrompt
+          systemPrompt,
+          {
+            sessionId,
+            runId: clientRunId,
+          }
         );
         
         const responseTime = Date.now() - startTime;
@@ -1747,6 +1767,9 @@ export class WebServer {
             content: msg.content,
             timestamp: msg.timestamp,
           })),
+          runId: result.runId,
+          sessionId: result.sessionId,
+          status: result.status,
           stats: {
             turns: result.turns,
             duration: result.duration,
@@ -1770,7 +1793,7 @@ export class WebServer {
     // Phase 2: Streaming agent endpoint (Server-Sent Events)
     this.app.post('/api/agent/stream', async (req, res) => {
       console.log(`[WEB] /api/agent/stream received request (SSE)`);
-      const { message, systemPrompt: clientSystemPrompt } = req.body;
+      const { message, systemPrompt: clientSystemPrompt, sessionId: clientSessionId, runId: clientRunId } = req.body;
       
       if (!message || typeof message !== 'string') {
         res.status(400).json({ error: 'Message is required' });
@@ -1781,6 +1804,7 @@ export class WebServer {
         res.status(500).json({ error: 'Memory streaming agent not available' });
         return;
       }
+      const memoryAgent = this.memoryStreamingAgent;
       
       // Set SSE headers
       res.writeHead(200, {
@@ -1790,8 +1814,15 @@ export class WebServer {
         'X-Accel-Buffering': 'no',
       });
       
+      const sessionId = clientSessionId || (this.memoryManager?.generateSessionId() ?? `web_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
+      const runId = clientRunId || this.runQueue.createRunId();
+
       // Send initial connection event
-      res.write('event: connected\ndata: {"status": "connected"}\n\n');
+      res.write(`event: connected\ndata: ${JSON.stringify({
+        status: 'connected',
+        sessionId,
+        runId,
+      })}\n\n`);
       
       // Use client system prompt or default
       const systemPrompt = clientSystemPrompt || this.systemPrompt;
@@ -1799,29 +1830,39 @@ export class WebServer {
       try {
         console.log(`[WEB] Starting streaming agent execution...`);
         
-        // Run with memory streaming
-        const result = await this.memoryStreamingAgent.runWithMemory(
-          message,
-          systemPrompt,
-          (event) => {
-            // Send event as SSE
-            const sseData = MemoryStreamingAgent.eventToSSE(event);
-            res.write(sseData);
-          }
+        // Run with memory streaming (serialized per session)
+        await this.runQueue.enqueue(
+          sessionId,
+          async (runMeta) => {
+            const controller = new AbortController();
+            const timeoutMs = this.agentIntegration?.getAgentLoop().getConfig().timeoutMs || 120000;
+            const timeout = setTimeout(() => {
+              runMeta.status = 'timeout';
+              controller.abort();
+            }, timeoutMs);
+
+            try {
+              await memoryAgent.runWithMemory(
+                message,
+                systemPrompt,
+                {
+                  sessionId,
+                  runId,
+                  signal: controller.signal,
+                  onEvent: (event) => {
+                    const sseData = MemoryStreamingAgent.eventToSSE(event);
+                    res.write(sseData);
+                  },
+                }
+              );
+            } finally {
+              clearTimeout(timeout);
+            }
+          },
+          runId
         );
         
         console.log(`[WEB] Streaming agent completed`);
-        
-        // Send completion event
-        res.write(MemoryStreamingAgent.eventToSSE({ 
-          type: 'agent_end',
-          message: { 
-            role: 'assistant', 
-            content: result.response,
-            timestamp: new Date()
-          } 
-        }));
-        
       } catch (error) {
         console.error(`[WEB] Memory streaming agent error:`, error);
         res.write(MemoryStreamingAgent.eventToSSE({

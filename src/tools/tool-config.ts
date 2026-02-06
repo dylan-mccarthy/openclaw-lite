@@ -78,9 +78,11 @@ export class ToolConfigManager {
     // Default configuration - ALL TOOLS AUTO-APPROVED for now
     const defaultConfigs: ToolConfig[] = [
       { name: 'read', enabled: true, dangerous: false, requiresApproval: false },
+      { name: 'read_file', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'write', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'edit', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'list', enabled: true, dangerous: false, requiresApproval: false },
+      { name: 'list_dir', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'exec', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'git_status', enabled: true, dangerous: false, requiresApproval: false },
       { name: 'git_log', enabled: true, dangerous: false, requiresApproval: false },

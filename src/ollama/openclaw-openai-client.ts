@@ -207,7 +207,7 @@ export class OpenClawOpenAIClient {
       description: string;
       parameters: any;
     }> = [],
-    options: Partial<OpenAICompletionRequest> & { timeout?: number } = {}
+    options: Partial<OpenAICompletionRequest> & { timeout?: number; signal?: AbortSignal } = {}
   ): Promise<OpenAICompletionResponse> {
     const model = options.model || this.defaultModel;
     const timeout = options.timeout || 120000;
@@ -245,6 +245,7 @@ export class OpenClawOpenAIClient {
           headers: {
             'Content-Type': 'application/json',
           },
+          signal: options.signal,
         }
       );
       
@@ -263,6 +264,138 @@ export class OpenClawOpenAIClient {
       }
       throw error;
     }
+  }
+
+  async streamChatCompletion(
+    messages: Message[],
+    systemPrompt: string = '',
+    tools: Array<{
+      name: string;
+      description: string;
+      parameters: any;
+    }> = [],
+    options: Partial<OpenAICompletionRequest> & { timeout?: number; signal?: AbortSignal } = {},
+    onDelta?: (delta: {
+      contentDelta?: string;
+      toolCalls?: Array<{ name: string; arguments: string }>;
+    }) => void
+  ): Promise<{ content: string; toolCalls: Array<{ name: string; arguments: any }> }> {
+    const model = options.model || this.defaultModel;
+    const timeout = options.timeout || 120000;
+
+    const openaiMessages = this.convertMessagesToOpenAI(messages, systemPrompt, model);
+    const openaiTools = tools.length > 0 ? this.convertToolsToOpenAI(tools) : undefined;
+
+    const request: OpenAICompletionRequest = {
+      model,
+      messages: openaiMessages,
+      temperature: options.temperature || this.defaultOptions.temperature,
+      max_tokens: options.max_tokens || this.defaultOptions.max_tokens,
+      stream: true,
+    };
+
+    if (openaiTools && openaiTools.length > 0) {
+      request.tools = openaiTools;
+      request.tool_choice = 'auto';
+    }
+
+    const toolCallMap = new Map<number, { name?: string; arguments: string }>();
+    let content = '';
+
+    console.log(`[OpenClaw OpenAI Client] Streaming request to ${this.baseUrl}/v1/chat/completions`);
+    console.log(`[OpenClaw OpenAI Client] Model: ${model}, Messages: ${openaiMessages.length}, Tools: ${openaiTools?.length || 0}`);
+
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}/v1/chat/completions`,
+        request,
+        {
+          timeout,
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          responseType: 'stream',
+          signal: options.signal,
+        }
+      );
+
+      const stream = response.data;
+
+      for await (const chunk of stream) {
+        const lines = chunk.toString().split('\n').filter((line: string) => line.trim());
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) {
+            continue;
+          }
+
+          const data = line.substring(6).trim();
+          if (data === '[DONE]') {
+            break;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta;
+
+            if (delta?.content) {
+              content += delta.content;
+              onDelta?.({ contentDelta: delta.content });
+            }
+
+            if (delta?.tool_calls && Array.isArray(delta.tool_calls)) {
+              for (const toolDelta of delta.tool_calls) {
+                const index = toolDelta.index ?? 0;
+                const existing = toolCallMap.get(index) || { arguments: '' };
+
+                if (toolDelta.function?.name) {
+                  existing.name = toolDelta.function.name;
+                }
+                if (toolDelta.function?.arguments) {
+                  existing.arguments += toolDelta.function.arguments;
+                }
+
+                toolCallMap.set(index, existing);
+              }
+
+              const toolCalls = Array.from(toolCallMap.values())
+                .filter(call => call.name)
+                .map(call => ({
+                  name: call.name as string,
+                  arguments: call.arguments,
+                }));
+
+              if (toolCalls.length > 0) {
+                onDelta?.({ toolCalls });
+              }
+            }
+          } catch (error) {
+            console.warn('[OpenClaw OpenAI Client] Failed to parse stream chunk:', error);
+          }
+        }
+      }
+    } catch (error: any) {
+      console.error('[OpenClaw OpenAI Client] Streaming error:', error.message);
+      throw error;
+    }
+
+    const toolCalls = Array.from(toolCallMap.values())
+      .filter(call => call.name)
+      .map(call => {
+        let parsedArgs: any = call.arguments;
+        if (call.arguments && typeof call.arguments === 'string') {
+          try {
+            parsedArgs = JSON.parse(call.arguments);
+          } catch {
+            parsedArgs = call.arguments;
+          }
+        }
+        return {
+          name: call.name as string,
+          arguments: parsedArgs,
+        };
+      });
+
+    return { content, toolCalls };
   }
   
   /**
