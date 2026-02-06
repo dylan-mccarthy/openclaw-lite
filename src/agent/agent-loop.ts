@@ -8,6 +8,9 @@ import type {
 } from './types.js';
 import type { Message } from '../context/types.js';
 import { EventStream } from './event-stream.js';
+import { ContextManager } from '../context/context-manager.js';
+import { TokenEstimator } from '../context/token-estimator.js';
+import type { AgentHooks, AgentHookContext, BeforeAgentStartResult, BeforeToolCallResult } from './hooks.js';
 import { OpenClawOpenAIClient } from '../ollama/openclaw-openai-client.js';
 import { ModelTemplateRegistry } from '../ollama/model-templates.js';
 import type { ToolBridge } from './tool-bridge.js';
@@ -21,6 +24,13 @@ export interface AgentLoopConfig {
   baseUrl?: string;
   allowDangerousTools?: boolean;
   requireApproval?: boolean;
+  formatToolResult?: (result: any) => string;
+  messagingToolNames?: string[];
+  maxContextTokens?: number;
+  reservedTokens?: number;
+  compressionStrategy?: 'truncate' | 'selective' | 'hybrid';
+  maxCompactionRetries?: number;
+  hooks?: AgentHooks;
   toolBridge: ToolBridge;
   sessionId?: string;
 }
@@ -28,8 +38,12 @@ export interface AgentLoopConfig {
 export class AgentLoop {
   private client: OpenClawOpenAIClient;
   private templateRegistry: ModelTemplateRegistry;
+  private contextManager: ContextManager;
+  private tokenEstimator: TokenEstimator;
   private config: Required<AgentLoopConfig>;
   private toolBridge?: ToolBridge;
+  private messagingToolOutputs: string[] = [];
+  private hooks: Required<AgentHooks>;
   
   constructor(config: AgentLoopConfig) {
     this.client = new OpenClawOpenAIClient({
@@ -38,7 +52,19 @@ export class AgentLoop {
       temperature: config.temperature,
     });
     this.templateRegistry = new ModelTemplateRegistry();
+    this.contextManager = new ContextManager({
+      maxContextTokens: config.maxContextTokens ?? 8192,
+      reservedTokens: config.reservedTokens ?? 1000,
+      compressionStrategy: config.compressionStrategy ?? 'hybrid',
+      keepFirstLast: true,
+    });
+    this.tokenEstimator = new TokenEstimator();
     this.toolBridge = config.toolBridge;
+    this.hooks = (config.hooks ?? {}) as Required<AgentHooks>;
+    this.hooks.beforeAgentStart = this.hooks.beforeAgentStart ?? [];
+    this.hooks.afterAgentEnd = this.hooks.afterAgentEnd ?? [];
+    this.hooks.beforeToolCall = this.hooks.beforeToolCall ?? [];
+    this.hooks.afterToolCall = this.hooks.afterToolCall ?? [];
     
     this.config = {
       model: config.model,
@@ -49,6 +75,13 @@ export class AgentLoop {
       baseUrl: config.baseUrl ?? 'http://localhost:11434',
       allowDangerousTools: config.allowDangerousTools ?? false,
       requireApproval: config.requireApproval ?? true,
+      formatToolResult: config.formatToolResult ?? this.defaultFormatToolResult,
+      messagingToolNames: config.messagingToolNames ?? [],
+      maxContextTokens: config.maxContextTokens ?? 8192,
+      reservedTokens: config.reservedTokens ?? 1000,
+      compressionStrategy: config.compressionStrategy ?? 'hybrid',
+      maxCompactionRetries: config.maxCompactionRetries ?? 1,
+      hooks: this.hooks,
       toolBridge: config.toolBridge,
       sessionId: config.sessionId ?? 'agent-session',
     };
@@ -68,6 +101,12 @@ export class AgentLoop {
     const toolExecutions: ToolExecutionResult[] = [];
     const messages: Message[] = [];
     let turns = 0;
+    const runId = options?.runId;
+    const sessionId = options?.sessionId || this.config.sessionId;
+
+    console.log(`[AgentLoop] run start (runId=${runId || 'n/a'}, sessionId=${sessionId})`);
+
+    this.messagingToolOutputs = [];
     
     // Get tools from ToolBridge if not provided
     let finalTools = tools;
@@ -98,44 +137,75 @@ export class AgentLoop {
     context.messages.push(userMessage);
     messages.push(userMessage);
     
+    const hookContext: AgentHookContext = {
+      runId,
+      sessionId,
+      prompt,
+      systemPrompt: context.systemPrompt,
+      messages: context.messages,
+      tools: context.tools,
+      config: context.config,
+    };
+
+    await this.runBeforeAgentStartHooks(hookContext, context, options, stream);
+
     // Emit start events
-    this.emitEvent(stream, { type: 'agent_start' }, options);
-    this.emitEvent(stream, { type: 'turn_start' }, options);
+    this.emitEvent(stream, { type: 'agent_start', runId, sessionId }, options);
+    this.emitEvent(stream, { type: 'turn_start', runId, sessionId }, options);
     this.emitEvent(stream, { 
       type: 'message_start', 
-      message: userMessage 
+      message: userMessage,
+      runId,
+      sessionId,
     }, options);
     this.emitEvent(stream, { 
       type: 'message_end', 
-      message: userMessage 
+      message: userMessage,
+      runId,
+      sessionId,
     }, options);
     
     try {
-      await this.runLoop(context, stream, toolExecutions, options);
+      await this.runLoop(context, stream, toolExecutions, {
+        ...options,
+        runId,
+        sessionId,
+      });
       turns = this.countTurns(context.messages);
     } catch (error) {
       this.emitEvent(stream, {
         type: 'error',
         error: error instanceof Error ? error.message : String(error),
+        runId,
+        sessionId,
       }, options);
       throw error;
     } finally {
       const duration = Date.now() - startTime;
       
       // Emit final events
-      this.emitEvent(stream, { type: 'agent_end' }, options);
+      this.emitEvent(stream, { type: 'agent_end', runId, sessionId }, options);
       stream.end();
       
       // Extract final response
-      const finalResponse = this.extractFinalResponse(context.messages);
+      const finalResponse = this.extractFinalResponse(context.messages, toolExecutions);
       
-      return {
+      const result: AgentResult = {
         response: finalResponse,
         toolExecutions,
         messages: context.messages,
         turns,
         duration,
+        runId,
+        sessionId,
+        startedAt: startTime,
+        endedAt: Date.now(),
+        status: 'completed',
       };
+
+      await this.runAfterAgentEndHooks(hookContext, result, options, stream);
+
+      return result;
     }
   }
   
@@ -149,6 +219,7 @@ export class AgentLoop {
     options?: AgentStreamOptions
   ): Promise<void> {
     let turn = 0;
+    let compactionAttempts = 0;
     
     while (turn < this.config.maxTurns) {
       turn++;
@@ -157,8 +228,21 @@ export class AgentLoop {
         this.emitEvent(stream, { type: 'turn_start' }, options);
       }
       
-      // Get assistant response
-      const assistantMessage = await this.getAssistantResponse(context, stream, options);
+      await this.maybeCompactContext(context, stream, options);
+
+      let assistantMessage: Message & { toolCalls?: Array<{ name: string; arguments: any }> };
+      try {
+        assistantMessage = await this.getAssistantResponse(context, stream, options);
+      } catch (error) {
+        if (this.isContextOverflowError(error) && compactionAttempts < this.config.maxCompactionRetries) {
+          compactionAttempts += 1;
+          console.warn(`[AgentLoop] Context overflow detected, retrying compaction (${compactionAttempts}/${this.config.maxCompactionRetries}) (runId=${options?.runId || 'n/a'})`);
+          await this.maybeCompactContext(context, stream, options, 'retry');
+          assistantMessage = await this.getAssistantResponse(context, stream, options);
+        } else {
+          throw error;
+        }
+      }
       context.messages.push(assistantMessage);
       
       // Check for tool calls
@@ -226,44 +310,77 @@ export class AgentLoop {
     );
     
     try {
-      const response = await this.client.chatCompletion(
-        context.messages,
-        enhancedSystemPrompt,
-        context.tools,
-        {
-          model: this.config.model,
-          temperature: this.config.temperature,
-          timeout: this.config.timeoutMs,
-        }
-      );
-      
-      const choice = response.choices[0];
-      if (!choice) {
-        throw new Error('No response from AI');
-      }
-      
-      const message = choice.message;
       const assistantMessage: Message & { toolCalls?: Array<{ name: string; arguments: any }> } = {
         role: 'assistant',
-        content: message.content || '',
+        content: '',
         timestamp: new Date(),
       };
-      
-      // Extract tool calls from OpenAI response
-      if (message.tool_calls && message.tool_calls.length > 0) {
-        console.log(`[AgentLoop] OpenAI returned ${message.tool_calls.length} tool calls`);
-        assistantMessage.toolCalls = message.tool_calls.map(tc => ({
-          name: tc.function.name,
-          arguments: JSON.parse(tc.function.arguments),
-        }));
-      }
-      
-      // Emit message events
+
       this.emitEvent(stream, {
         type: 'message_start',
         message: assistantMessage,
       }, options);
+
+      if (options?.onEvent) {
+        const streamResult = await this.client.streamChatCompletion(
+          context.messages,
+          enhancedSystemPrompt,
+          context.tools,
+          {
+            model: this.config.model,
+            temperature: this.config.temperature,
+            timeout: this.config.timeoutMs,
+            signal: options?.signal,
+          },
+          (delta) => {
+            if (delta.contentDelta) {
+              assistantMessage.content += delta.contentDelta;
+              this.emitEvent(stream, {
+                type: 'message_update',
+                message: {
+                  ...assistantMessage,
+                },
+              }, options);
+            }
+          }
+        );
+
+        if (streamResult.toolCalls.length > 0) {
+          assistantMessage.toolCalls = streamResult.toolCalls;
+          console.log(`[AgentLoop] Streaming returned ${streamResult.toolCalls.length} tool calls`);
+        }
+      } else {
+        const response = await this.client.chatCompletion(
+          context.messages,
+          enhancedSystemPrompt,
+          context.tools,
+          {
+            model: this.config.model,
+            temperature: this.config.temperature,
+            timeout: this.config.timeoutMs,
+            signal: options?.signal,
+          }
+        );
+        
+        const choice = response.choices[0];
+        if (!choice) {
+          throw new Error('No response from AI');
+        }
+        
+        const message = choice.message;
+        assistantMessage.content = message.content || '';
+        
+        // Extract tool calls from OpenAI response
+        if (message.tool_calls && message.tool_calls.length > 0) {
+          console.log(`[AgentLoop] OpenAI returned ${message.tool_calls.length} tool calls`);
+          assistantMessage.toolCalls = message.tool_calls.map(tc => ({
+            name: tc.function.name,
+            arguments: JSON.parse(tc.function.arguments),
+          }));
+        }
+      }
       
+      // Emit message events
       this.emitEvent(stream, {
         type: 'message_end',
         message: assistantMessage,
@@ -305,32 +422,68 @@ export class AgentLoop {
         throw new Error(`Tool not found: ${toolCall.name}`);
       }
       
+      const hookContext: AgentHookContext = {
+        runId: options?.runId,
+        sessionId: options?.sessionId,
+        prompt: '',
+        systemPrompt: '',
+        messages: [],
+        tools: availableTools,
+        config: this.config,
+      };
+
+      const updatedToolCall = await this.runBeforeToolCallHooks(
+        hookContext,
+        toolCall,
+        options,
+        stream
+      );
+
       // Execute tool via ToolBridge
       let result: any;
       if (this.toolBridge) {
         result = await this.toolBridge.executeTool(
-          toolCall.name,
-          toolCall.arguments,
-          { toolCallId, startTime, sessionId: this.config.sessionId }
+          updatedToolCall.name,
+          updatedToolCall.arguments,
+          { toolCallId, startTime, sessionId: options?.sessionId || this.config.sessionId }
         );
       } else {
         throw new Error('ToolBridge not configured');
       }
       
       const duration = Date.now() - startTime;
-      
-      return {
+
+      console.log(`[AgentLoop] Tool ${updatedToolCall.name} completed in ${duration}ms (runId=${options?.runId || 'n/a'})`);
+
+      this.emitEvent(stream, {
+        type: 'tool_update',
         toolCallId,
-        toolName: toolCall.name,
-        args: toolCall.arguments,
+        toolName: updatedToolCall.name,
+        args: updatedToolCall.arguments,
+        result: this.formatToolResult(result),
+        duration,
+      }, options);
+
+      this.recordMessagingOutput(updatedToolCall.name, result);
+      
+      const executionResult: ToolExecutionResult = {
+        toolCallId,
+        toolName: updatedToolCall.name,
+        args: updatedToolCall.arguments,
         result,
         duration,
         success: true,
       };
+
+      await this.runAfterToolCallHooks(hookContext, executionResult, options, stream);
+
+      return executionResult;
     } catch (error) {
       const duration = Date.now() - startTime;
+
+      console.warn(`[AgentLoop] Tool ${toolCall.name} failed in ${duration}ms (runId=${options?.runId || 'n/a'})`);
       
-      return {
+      const executionResult: ToolExecutionResult = {
         toolCallId,
         toolName: toolCall.name,
         args: toolCall.arguments,
@@ -338,6 +491,23 @@ export class AgentLoop {
         duration,
         success: false,
       };
+
+      await this.runAfterToolCallHooks(
+        {
+          runId: options?.runId,
+          sessionId: options?.sessionId,
+          prompt: '',
+          systemPrompt: '',
+          messages: [],
+          tools: availableTools,
+          config: this.config,
+        },
+        executionResult,
+        options,
+        stream
+      );
+
+      return executionResult;
     }
   }
   
@@ -444,6 +614,10 @@ Use plain human language for narration unless in a technical context.
    * Format tool result for display
    */
   private formatToolResult(result: any): string {
+    return this.config.formatToolResult(result);
+  }
+
+  private defaultFormatToolResult(result: any): string {
     if (typeof result === 'string') {
       return result;
     }
@@ -457,14 +631,196 @@ Use plain human language for narration unless in a technical context.
   /**
    * Extract final response from messages
    */
-  private extractFinalResponse(messages: Message[]): string {
+  private extractFinalResponse(
+    messages: Message[],
+    toolExecutions: ToolExecutionResult[]
+  ): string {
     const lastMessage = messages[messages.length - 1];
     if (lastMessage?.role === 'assistant') {
-      return typeof lastMessage.content === 'string' 
-        ? lastMessage.content 
+      const rawContent = typeof lastMessage.content === 'string'
+        ? lastMessage.content
         : String(lastMessage.content);
+      const cleaned = rawContent.replace(/\bNO_REPLY\b/g, '').trim();
+      if (!cleaned) {
+        return '';
+      }
+      if (this.isDuplicateMessagingReply(cleaned)) {
+        return '';
+      }
+      return cleaned;
+    }
+
+    const failures = toolExecutions.filter(exec => !exec.success);
+    if (failures.length > 0) {
+      if (failures.length === 1) {
+        const failure = failures[0];
+        return `A tool failed: ${failure.toolName} - ${failure.error || 'unknown error'}`;
+      }
+      const details = failures
+        .map(failure => `- ${failure.toolName}: ${failure.error || 'unknown error'}`)
+        .join('\n');
+      return `Multiple tools failed:\n${details}`;
     }
     return '';
+  }
+
+  private recordMessagingOutput(toolName: string, result: any): void {
+    if (!this.config.messagingToolNames.includes(toolName)) {
+      return;
+    }
+    const formatted = this.formatToolResult(result).trim();
+    if (!formatted) {
+      return;
+    }
+    this.messagingToolOutputs.push(formatted);
+    if (this.messagingToolOutputs.length > 200) {
+      this.messagingToolOutputs.splice(0, this.messagingToolOutputs.length - 200);
+    }
+  }
+
+  private isDuplicateMessagingReply(reply: string): boolean {
+    const normalizedReply = this.normalizeText(reply);
+    if (!normalizedReply) {
+      return false;
+    }
+    return this.messagingToolOutputs.some(output => this.normalizeText(output) === normalizedReply);
+  }
+
+  private normalizeText(text: string): string {
+    return text.replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  private async runBeforeAgentStartHooks(
+    hookContext: AgentHookContext,
+    context: AgentContext,
+    options: AgentStreamOptions | undefined,
+    stream: EventStream
+  ): Promise<void> {
+    for (const hook of this.hooks.beforeAgentStart) {
+      try {
+        const result = await hook(hookContext);
+        if (!result) {
+          continue;
+        }
+        if (result.prompt) {
+          hookContext.prompt = result.prompt;
+        }
+        if (result.systemPrompt) {
+          hookContext.systemPrompt = result.systemPrompt;
+          context.systemPrompt = result.systemPrompt;
+        }
+        if (result.messages) {
+          hookContext.messages = result.messages;
+          context.messages = result.messages;
+        }
+      } catch (error) {
+        this.emitEvent(stream, {
+          type: 'warning',
+          error: error instanceof Error ? error.message : String(error),
+        }, options);
+      }
+    }
+  }
+
+  private async runAfterAgentEndHooks(
+    hookContext: AgentHookContext,
+    result: AgentResult,
+    options: AgentStreamOptions | undefined,
+    stream: EventStream
+  ): Promise<void> {
+    for (const hook of this.hooks.afterAgentEnd) {
+      try {
+        await hook(hookContext, result);
+      } catch (error) {
+        this.emitEvent(stream, {
+          type: 'warning',
+          error: error instanceof Error ? error.message : String(error),
+        }, options);
+      }
+    }
+  }
+
+  private async runBeforeToolCallHooks(
+    hookContext: AgentHookContext,
+    toolCall: { name: string; arguments: any },
+    options: AgentStreamOptions | undefined,
+    stream: EventStream
+  ): Promise<{ name: string; arguments: any }> {
+    let updated: { name: string; arguments: any } = { ...toolCall };
+    for (const hook of this.hooks.beforeToolCall) {
+      try {
+        const result = await hook(hookContext, updated);
+        if (result?.arguments !== undefined) {
+          updated = { ...updated, arguments: result.arguments };
+        }
+      } catch (error) {
+        this.emitEvent(stream, {
+          type: 'warning',
+          error: error instanceof Error ? error.message : String(error),
+        }, options);
+      }
+    }
+    return updated;
+  }
+
+  private async runAfterToolCallHooks(
+    hookContext: AgentHookContext,
+    execution: ToolExecutionResult,
+    options: AgentStreamOptions | undefined,
+    stream: EventStream
+  ): Promise<void> {
+    for (const hook of this.hooks.afterToolCall) {
+      try {
+        await hook(hookContext, execution);
+      } catch (error) {
+        this.emitEvent(stream, {
+          type: 'warning',
+          error: error instanceof Error ? error.message : String(error),
+        }, options);
+      }
+    }
+  }
+
+  private async maybeCompactContext(
+    context: AgentContext,
+    stream: EventStream,
+    options?: AgentStreamOptions,
+    reason: 'preflight' | 'retry' = 'preflight'
+  ): Promise<void> {
+    const systemTokens = this.tokenEstimator.estimate(context.systemPrompt || '');
+    const availableTokens = this.config.maxContextTokens - this.config.reservedTokens - systemTokens;
+    const currentTokens = context.messages.reduce(
+      (sum, msg) => sum + this.tokenEstimator.estimateMessageWithRole(msg),
+      0
+    );
+
+    if (currentTokens <= availableTokens) {
+      return;
+    }
+
+    const originalCount = context.messages.length;
+    const compressionResult = await this.contextManager.compressHistory(
+      context.messages,
+      context.systemPrompt,
+      this.config.model
+    );
+
+    context.messages = compressionResult.messages;
+
+    console.log(`[AgentLoop] Compaction ${reason} ${originalCount} -> ${compressionResult.messages.length} messages (runId=${options?.runId || 'n/a'})`);
+
+    this.emitEvent(stream, {
+      type: 'compaction',
+      originalMessages: originalCount,
+      compressedMessages: compressionResult.messages.length,
+      compressionRatio: compressionResult.compressionRatio,
+      compactionReason: reason,
+    }, options);
+  }
+
+  private isContextOverflowError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /context|token|length|too long/i.test(message);
   }
   
   /**
@@ -492,8 +848,14 @@ Use plain human language for narration unless in a technical context.
     event: AgentEvent,
     options?: AgentStreamOptions
   ): void {
-    stream.push(event);
-    options?.onEvent?.(event);
+    const stampedEvent = {
+      ...event,
+      timestamp: event.timestamp || new Date().toISOString(),
+      runId: event.runId || options?.runId,
+      sessionId: event.sessionId || options?.sessionId,
+    };
+    stream.push(stampedEvent);
+    options?.onEvent?.(stampedEvent);
   }
   
   /**

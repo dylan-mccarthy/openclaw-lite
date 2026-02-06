@@ -35,7 +35,7 @@ export class SteeringStreamingAgent extends StreamingAgent {
   async runWithSteering(
     prompt: string,
     systemPrompt: string = '',
-    onEvent?: (event: AgentEvent) => void
+    options?: AgentStreamOptions
   ): Promise<{
     response: string;
     events: AgentEvent[];
@@ -51,13 +51,15 @@ export class SteeringStreamingAgent extends StreamingAgent {
     let queuedMessagesProcessed = 0;
     
     const eventHandler = (event: AgentEvent) => {
-      events.push(event);
-      onEvent?.(event);
+      const stampedEvent = {
+        ...event,
+        timestamp: event.timestamp || new Date().toISOString(),
+        runId: event.runId || options?.runId,
+        sessionId: event.sessionId || options?.sessionId,
+      };
+      events.push(stampedEvent);
+      options?.onEvent?.(stampedEvent);
     };
-    
-    // Start events
-    eventHandler({ type: 'agent_start' });
-    eventHandler({ type: 'turn_start' });
     
     try {
       // Check for queued messages before starting
@@ -77,33 +79,27 @@ export class SteeringStreamingAgent extends StreamingAgent {
       const result = await this.runWithStreaming(
         prompt,
         systemPrompt,
-        (event) => {
-          // Check for interruptions during execution
-          if (this.isInterrupted && event.type === 'turn_end') {
-            console.log(`[SteeringStreamingAgent] Interruption detected, stopping after current turn`);
-            // We could throw an error here to stop execution
-          }
-          
-          eventHandler(event);
-          
-          // Check for queued messages after each turn
-          if (event.type === 'turn_end' && this.steeringController.hasPendingMessages()) {
-            console.log(`[SteeringStreamingAgent] Processing queued messages between turns`);
-            this.processQueuedMessages(eventHandler).then(count => {
-              queuedMessagesProcessed += count;
-            });
+        {
+          ...options,
+          onEvent: (event) => {
+            // Check for interruptions during execution
+            if (this.isInterrupted && event.type === 'turn_end') {
+              console.log(`[SteeringStreamingAgent] Interruption detected, stopping after current turn`);
+              // We could throw an error here to stop execution
+            }
+            
+            eventHandler(event);
+            
+            // Check for queued messages after each turn
+            if (event.type === 'turn_end' && this.steeringController.hasPendingMessages()) {
+              console.log(`[SteeringStreamingAgent] Processing queued messages between turns`);
+              this.processQueuedMessages(eventHandler).then(count => {
+                queuedMessagesProcessed += count;
+              });
+            }
           }
         }
       );
-      
-      eventHandler({ 
-        type: 'agent_end',
-        message: { 
-          role: 'assistant', 
-          content: result.response,
-          timestamp: new Date()
-        } 
-      });
       
       return {
         response: result.response,

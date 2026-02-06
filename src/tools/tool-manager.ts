@@ -220,6 +220,34 @@ export class ToolManager implements ToolRegistry {
       }
     }, this.handleRead.bind(this));
 
+      // File read tool (alias)
+      this.registerTool({
+        name: 'read_file',
+        description: 'Read the contents of a file',
+        category: 'file',
+        parameters: {
+          path: {
+            type: 'string',
+            description: 'Path to the file to read (relative to workspace)',
+            required: true
+          },
+          offset: {
+            type: 'number',
+            description: 'Line number to start reading from (1-indexed)',
+            required: false
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum number of lines to read',
+            required: false
+          }
+        },
+        returns: {
+          type: 'string',
+          description: 'File contents'
+        }
+      }, this.handleRead.bind(this));
+
     // File write tool
     this.registerTool({
       name: 'write',
@@ -299,6 +327,31 @@ export class ToolManager implements ToolRegistry {
         description: 'Array of file/directory entries'
       }
     }, this.handleList.bind(this));
+
+      // List directory tool (alias)
+      this.registerTool({
+        name: 'list_dir',
+        description: 'List files and directories in a path',
+        category: 'file',
+        parameters: {
+          path: {
+            type: 'string',
+            description: 'Path to list (relative to workspace, defaults to workspace root)',
+            required: false,
+            default: '.'
+          },
+          recursive: {
+            type: 'boolean',
+            description: 'Whether to list recursively',
+            required: false,
+            default: false
+          }
+        },
+        returns: {
+          type: 'array',
+          description: 'Array of file/directory entries'
+        }
+      }, this.handleList.bind(this));
 
     // Execute command tool
     this.registerTool({
