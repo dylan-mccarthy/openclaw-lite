@@ -3,6 +3,8 @@ import chalk from 'chalk';
 import { OllamaIntegration } from '../ollama/integration.js';
 import { FileLoader } from '../identity/file-loader.js';
 import { initializeConfigSync } from '../config/openclaw-lite-config.js';
+import { buildLiteSystemPrompt } from '../agent/system-prompt-lite.js';
+import { defaultToolDescriptions } from '../agent/basic-prompt.js';
 import type { Message } from '../context/types.js';
 
 export interface ConsoleUIOptions {
@@ -154,7 +156,24 @@ ${chalk.gray('─'.repeat(60))}
     process.stdout.write(chalk.gray('📚 Loading identity files... '));
     
     try {
-      this.options.systemPrompt = await this.fileLoader.constructSystemPrompt();
+      const identityPrompt = await this.fileLoader.buildIdentityPrompt();
+      const toolSummaries = defaultToolDescriptions.map(tool => ({
+        name: tool.name,
+        summary: tool.description,
+      }));
+
+      this.options.systemPrompt = buildLiteSystemPrompt({
+        workspaceDir: process.cwd(),
+        systemBase: identityPrompt,
+        toolSummaries,
+        runtimeInfo: {
+          model: this.options.model,
+          os: `${process.platform} ${process.arch}`,
+          node: process.version,
+        },
+        maxContextTokens: this.options.maxContextTokens,
+        reservedTokens: 1000,
+      });
       console.log(chalk.green('✅ Loaded\n'));
       
       const identity = await this.fileLoader.loadIdentity();

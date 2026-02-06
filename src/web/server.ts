@@ -11,6 +11,7 @@ import { AgentIntegration } from '../agent/agent-integration.js';
 import { RunQueue } from '../agent/run-queue.js';
 import { MemoryIntegration } from '../agent/memory-integration.js';
 import { MemoryStreamingAgent } from '../agent/memory-streaming-agent.js';
+import { buildLiteSystemPrompt } from '../agent/system-prompt-lite.js';
 import { getConfigManager, initializeConfigSync } from '../config/openclaw-lite-config.js';
 import { createDefaultBasicPrompt } from '../agent/basic-prompt.js';
 import { PersonalityUpdater } from '../identity/personality-updater.js';
@@ -2196,7 +2197,24 @@ export class WebServer {
     console.log('📚 Loading identity files...');
     
     try {
-      this.systemPrompt = await this.fileLoader.constructSystemPrompt();
+      const identityPrompt = await this.fileLoader.buildIdentityPrompt();
+      const toolSummaries = this.toolManager.listTools().map(tool => ({
+        name: tool.name,
+        summary: tool.description || `Use ${tool.name} tool`,
+      }));
+
+      this.systemPrompt = buildLiteSystemPrompt({
+        workspaceDir: this.workspacePath,
+        systemBase: identityPrompt,
+        toolSummaries,
+        runtimeInfo: {
+          model: this.options.model,
+          os: `${os.type()} ${os.release()}`,
+          node: process.version,
+        },
+        maxContextTokens: this.options.maxContextTokens,
+        reservedTokens: 1000,
+      });
       console.log('✅ Identity loaded from SOUL.md, USER.md, and memory files');
       console.log(`   System prompt length: ${this.systemPrompt.length}`);
       

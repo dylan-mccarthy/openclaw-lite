@@ -579,6 +579,10 @@ export class AgentLoop {
     if (tools.length === 0) {
       return systemPrompt;
     }
+
+    if (/^##\s+Tooling/m.test(systemPrompt)) {
+      return systemPrompt;
+    }
     
     const toolDescriptions = tools
       .map(tool => `- ${tool.name}: ${tool.description}`)

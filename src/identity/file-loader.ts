@@ -135,39 +135,9 @@ export class FileLoader {
   }
   
   async constructSystemPrompt(): Promise<string> {
-    if (this.securityManager) {
-      await this.ensureEncryptedFiles();
-    }
-    const identity = await this.loadIdentity();
-    const parts: string[] = [];
-    
-    // Start with SOUL.md if it exists
-    if (identity.soul) {
-      parts.push(identity.soul);
-    } else {
-      // Default prompt if no SOUL.md
-      parts.push(`You are a helpful AI assistant. Be concise, resourceful, and proactive.`);
-    }
-    
-    // Add USER.md context if it exists
-    if (identity.user) {
-      parts.push(`\n## About the person you're helping:\n${identity.user}`);
-    }
-    
-    // Add recent memory if it exists
-    if (identity.recentMemory && identity.recentMemory.length > 0) {
-      parts.push(`\n## Recent context:\n${identity.recentMemory.join('\n')}`);
-    }
-    
-    // Add memory summary if it exists
-    if (identity.memory && identity.memory.length > 0) {
-      parts.push(`\n## Long-term context (summary):\n${identity.memory.slice(0, 3).join('\n')}`);
-      if (identity.memory.length > 3) {
-        parts.push(`... and ${identity.memory.length - 3} more memory entries.`);
-      }
-    }
-    
-    // Add instructions
+    const basePrompt = await this.buildIdentityPrompt();
+    const parts = [basePrompt.trim()];
+
     parts.push(`
 ## Instructions:
 - Be resourceful: try to figure things out before asking
@@ -179,7 +149,43 @@ export class FileLoader {
   - You can access workspace files via tools (use the read tool when asked)
   - Never claim you cannot access local files when a tool can read them
 `);
-    
+
+    return parts.join('\n');
+  }
+
+  async buildIdentityPrompt(): Promise<string> {
+    if (this.securityManager) {
+      await this.ensureEncryptedFiles();
+    }
+    const identity = await this.loadIdentity();
+    const parts: string[] = [];
+
+    // Start with SOUL.md if it exists
+    if (identity.soul) {
+      parts.push(identity.soul);
+    } else {
+      // Default prompt if no SOUL.md
+      parts.push('You are a helpful AI assistant. Be concise, resourceful, and proactive.');
+    }
+
+    // Add USER.md context if it exists
+    if (identity.user) {
+      parts.push(`\n## About the person you're helping:\n${identity.user}`);
+    }
+
+    // Add recent memory if it exists
+    if (identity.recentMemory && identity.recentMemory.length > 0) {
+      parts.push(`\n## Recent context:\n${identity.recentMemory.join('\n')}`);
+    }
+
+    // Add memory summary if it exists
+    if (identity.memory && identity.memory.length > 0) {
+      parts.push(`\n## Long-term context (summary):\n${identity.memory.slice(0, 3).join('\n')}`);
+      if (identity.memory.length > 3) {
+        parts.push(`... and ${identity.memory.length - 3} more memory entries.`);
+      }
+    }
+
     return parts.join('\n');
   }
   
