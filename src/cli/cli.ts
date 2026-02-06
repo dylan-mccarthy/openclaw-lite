@@ -4,13 +4,59 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import readline from 'readline';
+import fs from 'fs/promises';
+import path from 'path';
+import fetch from 'node-fetch';
 import { ContextManager } from '../context/context-manager.js';
 import { ModelRouter } from '../context/model-router.js';
 import { TokenEstimator } from '../context/token-estimator.js';
 import { OllamaIntegration } from '../ollama/integration.js';
-import { initializeConfig } from '../config/openclaw-lite-config.js';
+import { OpenClawLiteConfigSchema, initializeConfig } from '../config/openclaw-lite-config.js';
+import { TelegramPairingStore } from '../telegram/pairing-store.js';
+import { SkillRegistryClient } from '../skills/registry-client.js';
+import { SkillActivationStore } from '../skills/activation-store.js';
+import { CronStore } from '../cron/cron-store.js';
+import type { CronJob } from '../cron/cron-store.js';
 import { join, basename } from 'path';
 import type { Message } from '../context/types.js';
+
+async function promptInput(question: string, defaultValue?: string): Promise<string> {
+  const prompt = defaultValue ? `${question} (${defaultValue}): ` : `${question}: `;
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const answer = await new Promise<string>((resolve) => {
+    rl.question(prompt, (value) => {
+      resolve(value);
+    });
+  });
+
+  rl.close();
+
+  if (!answer.trim() && defaultValue !== undefined) {
+    return defaultValue;
+  }
+
+  return answer.trim();
+}
+
+async function writePidFile(pidFile: string): Promise<void> {
+  await fs.mkdir(path.dirname(pidFile), { recursive: true });
+  await fs.writeFile(pidFile, `${process.pid}`, 'utf-8');
+}
+
+async function removePidFile(pidFile: string): Promise<void> {
+  try {
+    await fs.unlink(pidFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.warn('Failed to remove PID file:', error);
+    }
+  }
+}
 
 const program = new Command();
 
@@ -78,6 +124,161 @@ program
       console.error(chalk.red('\nError:'), error instanceof Error ? error.message : String(error));
       process.exit(1);
     }
+  });
+
+// Onboarding command
+program
+  .command('onboard')
+  .description('Run initial OpenClaw Lite setup')
+  .option('-w, --workspace <path>', 'Workspace directory')
+  .option('-u, --url <url>', 'Ollama API URL')
+  .option('-m, --model <name>', 'Default model')
+  .option('-p, --port <port>', 'Web server port')
+  .option('--gateway-token <token>', 'Gateway auth token')
+  .action(async (options) => {
+    console.log(chalk.bold('🧭 OpenClaw Lite Onboarding'));
+    console.log(chalk.gray('─'.repeat(60)));
+
+    const configManager = await initializeConfig();
+    const config = configManager.getConfig();
+
+    const workspacePath = options.workspace || await promptInput('Workspace path', config.workspace.path);
+    const ollamaUrl = options.url || await promptInput('Ollama URL', config.ollama.url);
+    const model = options.model || await promptInput('Default model', config.ollama.defaultModel);
+    const portValue = options.port || await promptInput('Web server port', String(config.web.port));
+    const gatewayToken = options.gatewayToken || await promptInput('Gateway auth token (optional)', config.gateway.authToken || '');
+    const telegramToken = await promptInput('Telegram bot token (optional)', config.telegram.botToken || '');
+    const telegramUsername = telegramToken
+      ? await promptInput('Telegram bot username (optional)', config.telegram.botUsername || '')
+      : '';
+
+    const parsedPort = Number.parseInt(portValue, 10);
+    if (Number.isNaN(parsedPort) || parsedPort <= 0) {
+      console.error(chalk.red('❌ Invalid port provided.'));
+      process.exit(1);
+    }
+
+    configManager.updateConfig({
+      workspace: {
+        ...config.workspace,
+        path: workspacePath,
+      },
+      ollama: {
+        ...config.ollama,
+        url: ollamaUrl,
+        defaultModel: model,
+      },
+      web: {
+        ...config.web,
+        port: parsedPort,
+      },
+      gateway: {
+        ...config.gateway,
+        authToken: gatewayToken,
+      },
+      telegram: {
+        ...config.telegram,
+        enabled: Boolean(telegramToken),
+        botToken: telegramToken,
+        botUsername: telegramUsername,
+      },
+    });
+
+    await configManager.save();
+    await configManager.ensureDirectories();
+
+    if (telegramToken) {
+      const pairingStore = new TelegramPairingStore(configManager.getConfigPath());
+      const pending = pairingStore.listPending();
+
+      if (pending.length > 0) {
+        console.log(chalk.gray('\nPending Telegram pairing requests:'));
+        pending.forEach(({ code, entry }) => {
+          const expires = new Date(entry.expiresAt).toLocaleString();
+          console.log(`${chalk.cyan(code)}  chatId=${entry.chatId}  expires=${expires}`);
+        });
+
+        const code = await promptInput('Approve a pairing code now (optional)', '');
+        if (code) {
+          const chatId = pairingStore.approvePairing(code);
+          if (chatId) {
+            console.log(chalk.green(`✅ Pairing approved for chat ${chatId}`));
+          } else {
+            console.log(chalk.yellow('⚠️  Pairing code not found or expired.'));
+          }
+        }
+      }
+    }
+
+    console.log(chalk.green('\n✅ Onboarding complete'));
+    console.log(chalk.gray(`Config saved at ${configManager.getConfigFilePath()}`));
+    console.log(chalk.gray(`Workspace: ${workspacePath}`));
+  });
+
+// Telegram command
+const telegramCommand = program
+  .command('telegram')
+  .description('Manage Telegram integration');
+
+const telegramPairingCommand = telegramCommand
+  .command('pairing')
+  .description('Manage Telegram pairing approvals');
+
+telegramPairingCommand
+  .command('pending')
+  .description('List pending pairing codes')
+  .action(async () => {
+    const configManager = await initializeConfig();
+    const store = new TelegramPairingStore(configManager.getConfigPath());
+    const pending = store.listPending();
+
+    if (pending.length === 0) {
+      console.log(chalk.gray('No pending pairing requests.'));
+      return;
+    }
+
+    console.log(chalk.bold('Pending Pairing Codes'));
+    console.log(chalk.gray('─'.repeat(60)));
+    pending.forEach(({ code, entry }) => {
+      const expires = new Date(entry.expiresAt).toLocaleString();
+      console.log(`${chalk.cyan(code)}  chatId=${entry.chatId}  expires=${expires}`);
+    });
+  });
+
+telegramPairingCommand
+  .command('approve')
+  .argument('<code>', 'Pairing code to approve')
+  .action(async (code: string) => {
+    const configManager = await initializeConfig();
+    const store = new TelegramPairingStore(configManager.getConfigPath());
+    const chatId = store.approvePairing(code);
+
+    if (!chatId) {
+      console.log(chalk.red('❌ Pairing code not found or expired.'));
+      process.exit(1);
+    }
+
+    console.log(chalk.green(`✅ Pairing approved for chat ${chatId}`));
+  });
+
+telegramPairingCommand
+  .command('allowlist')
+  .description('List allowed Telegram chat IDs')
+  .action(async () => {
+    const configManager = await initializeConfig();
+    const store = new TelegramPairingStore(configManager.getConfigPath());
+    const allowlist = store.getAllowlist();
+
+    if (allowlist.length === 0) {
+      console.log(chalk.gray('No Telegram chats are allowlisted yet.'));
+      return;
+    }
+
+    console.log(chalk.bold('Telegram Allowlist'));
+    console.log(chalk.gray('─'.repeat(60)));
+    allowlist.forEach(chatId => {
+      console.log(chalk.cyan(chatId));
+    });
   });
 
 // Model routing commands
@@ -408,6 +609,123 @@ program
     }
   });
 
+// Gateway command
+const gatewayCommand = program
+  .command('gateway')
+  .description('Manage the gateway control plane');
+
+gatewayCommand
+  .command('start')
+  .description('Start the gateway (web server + control plane)')
+  .option('-p, --port <port>', 'Port to listen on')
+  .option('-u, --url <url>', 'Ollama API URL')
+  .option('-m, --model <name>', 'Model to use')
+  .option('-c, --context <tokens>', 'Max context tokens')
+  .option('--pid-file <path>', 'Path to PID file')
+  .action(async (options) => {
+    console.log(chalk.gray('Starting OpenClaw Lite Gateway...\n'));
+
+    try {
+      const configManager = await initializeConfig();
+      const config = configManager.getConfig();
+      const url = options.url || config.ollama.url;
+      const model = options.model || config.ollama.defaultModel;
+      const port = options.port ? parseInt(options.port) : config.web.port;
+      const maxContextTokens = options.context ? parseInt(options.context) : config.web.maxContextTokens;
+      const pidFile = options.pidFile || join(configManager.getWorkspacePath(), 'gateway.pid');
+
+      const { startWebServer } = await import('../web/server.js');
+
+      await writePidFile(pidFile);
+      const cleanup = async () => {
+        await removePidFile(pidFile);
+      };
+
+      process.on('SIGINT', () => {
+        cleanup().finally(() => process.exit(0));
+      });
+      process.on('SIGTERM', () => {
+        cleanup().finally(() => process.exit(0));
+      });
+      process.on('exit', () => {
+        void cleanup();
+      });
+
+      await startWebServer({
+        port,
+        ollamaUrl: url,
+        model,
+        maxContextTokens,
+        enableCors: config.web.enableCors,
+      });
+    } catch (error) {
+      console.error(chalk.red('Failed to start gateway:'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
+gatewayCommand
+  .command('status')
+  .description('Check gateway status')
+  .option('-p, --port <port>', 'Port to check')
+  .option('--host <host>', 'Host to check', 'localhost')
+  .action(async (options) => {
+    try {
+      const configManager = await initializeConfig();
+      const config = configManager.getConfig();
+      const port = options.port ? parseInt(options.port) : config.web.port;
+      const host = options.host || 'localhost';
+      const url = `http://${host}:${port}/api/health`;
+
+      const response = await fetch(url);
+      if (!response.ok) {
+        console.error(chalk.red(`❌ Gateway unhealthy: ${response.status} ${response.statusText}`));
+        process.exit(1);
+      }
+
+      const payload = await response.json();
+      console.log(chalk.bold('✅ Gateway is healthy'));
+      console.log(chalk.gray('─'.repeat(60)));
+      console.log(`Status: ${payload.status}`);
+      console.log(`Model: ${payload.model}`);
+      console.log(`Gateway: ${payload.gateway?.enabled ? 'enabled' : 'disabled'}`);
+      if (payload.gateway?.wsPath) {
+        console.log(`WS Path: ${payload.gateway.wsPath}`);
+      }
+      if (payload.gateway?.connectedClients !== undefined) {
+        console.log(`Clients: ${payload.gateway.connectedClients}`);
+      }
+    } catch (error) {
+      console.error(chalk.red('❌ Gateway not reachable'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
+gatewayCommand
+  .command('stop')
+  .description('Stop gateway using PID file')
+  .option('--pid-file <path>', 'Path to PID file')
+  .action(async (options) => {
+    try {
+      const configManager = await initializeConfig();
+      const pidFile = options.pidFile || join(configManager.getWorkspacePath(), 'gateway.pid');
+      const pidText = await fs.readFile(pidFile, 'utf-8');
+      const pid = Number.parseInt(pidText.trim(), 10);
+
+      if (Number.isNaN(pid)) {
+        console.error(chalk.red('❌ Invalid PID file contents'));
+        process.exit(1);
+      }
+
+      process.kill(pid, 'SIGTERM');
+      await removePidFile(pidFile);
+      console.log(chalk.green(`✅ Sent SIGTERM to gateway (${pid})`));
+    } catch (error) {
+      console.error(chalk.red('❌ Failed to stop gateway'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
 // Security command
 program
   .command('security')
@@ -549,7 +867,7 @@ program
   });
 
 // Config command
-program
+const configCommand = program
   .command('config')
   .description('Manage OpenClaw Lite configuration')
   .option('-s, --show', 'Show current configuration')
@@ -607,6 +925,60 @@ program
       console.log(JSON.stringify(config, null, 2));
       console.log(chalk.gray('\nConfig file:'), configManager.getConfigFilePath());
       return;
+    }
+  });
+
+configCommand
+  .command('validate')
+  .description('Validate configuration file')
+  .action(async () => {
+    const configManager = await initializeConfig();
+    const configPath = configManager.getConfigFilePath();
+
+    let rawConfig = '';
+    try {
+      rawConfig = await fs.readFile(configPath, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        console.log(chalk.yellow('⚠️  No configuration file found. Defaults will be used.'));
+        console.log(chalk.gray(`Expected at: ${configPath}`));
+        return;
+      }
+
+      console.error(chalk.red('❌ Failed to read configuration file'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawConfig);
+    } catch (error) {
+      console.error(chalk.red('❌ Configuration file is not valid JSON'));
+      console.error(chalk.gray(error instanceof Error ? error.message : String(error)));
+      process.exit(1);
+    }
+
+    const result = OpenClawLiteConfigSchema.safeParse(parsed);
+    if (!result.success) {
+      console.error(chalk.red('❌ Configuration validation failed'));
+      console.log(chalk.gray('─'.repeat(60)));
+      result.error.issues.forEach((issue) => {
+        const pathLabel = issue.path.length > 0 ? issue.path.join('.') : 'root';
+        console.log(`${chalk.red('•')} ${chalk.cyan(pathLabel)}: ${issue.message}`);
+      });
+      process.exit(1);
+    }
+
+    const config = result.data;
+    console.log(chalk.green('✅ Configuration is valid'));
+    console.log(chalk.gray('─'.repeat(60)));
+    console.log(`Workspace: ${chalk.cyan(config.workspace.path)}`);
+    console.log(`Ollama URL: ${chalk.cyan(config.ollama.url)}`);
+    console.log(`Model: ${chalk.cyan(config.ollama.defaultModel)}`);
+    console.log(`Gateway: ${config.gateway.enabled ? chalk.green('enabled') : chalk.yellow('disabled')}`);
+
+    if (config.gateway.enabled && !config.gateway.authToken && !config.gateway.allowUnauthenticated) {
+      console.log(chalk.yellow('⚠️  Gateway auth token is empty. Connections will be unauthenticated.'));
     }
   });
 
@@ -723,6 +1095,156 @@ program
     }
   });
 
+// Cron commands
+program
+  .command('cron')
+  .description('Manage scheduled jobs')
+  .option('-l, --list', 'List cron jobs')
+  .option('--runs [jobId]', 'List recent runs (optionally for a job)')
+  .option('--add', 'Add a new cron job')
+  .option('--update <id>', 'Update an existing job by id')
+  .option('--delete <id>', 'Delete a job by id')
+  .option('--enable <id>', 'Enable a job by id')
+  .option('--disable <id>', 'Disable a job by id')
+  .option('--trigger <id>', 'Trigger a job immediately')
+  .action(async (options) => {
+    const configManager = await initializeConfig();
+    const store = new CronStore(configManager.getConfigPath());
+
+    if (options.list) {
+      const jobs = store.listJobs();
+      if (jobs.length === 0) {
+        console.log(chalk.gray('No cron jobs configured.'));
+        return;
+      }
+
+      console.log(chalk.bold('⏰ Cron Jobs'));
+      console.log(chalk.gray('─'.repeat(80)));
+      jobs.forEach(job => {
+        console.log(`${job.enabled ? chalk.green('●') : chalk.gray('○')} ${chalk.bold(job.name)} (${job.id})`);
+        console.log(`  ${chalk.gray('Schedule:')} ${job.schedule}`);
+        console.log(`  ${chalk.gray('Message:')} ${job.message}`);
+        if (job.nextRunAt) {
+          console.log(`  ${chalk.gray('Next run:')} ${new Date(job.nextRunAt).toLocaleString()}`);
+        }
+        console.log();
+      });
+      return;
+    }
+
+    if (options.runs !== undefined) {
+      const runs = store.listRuns(typeof options.runs === 'string' ? options.runs : undefined);
+      if (runs.length === 0) {
+        console.log(chalk.gray('No cron runs recorded.'));
+        return;
+      }
+
+      console.log(chalk.bold('Cron Runs'));
+      console.log(chalk.gray('─'.repeat(80)));
+      runs.forEach(run => {
+        console.log(`${chalk.cyan(run.jobId)} ${run.status} ${new Date(run.startedAt).toLocaleString()}`);
+        if (run.error) {
+          console.log(`  ${chalk.red(run.error)}`);
+        }
+      });
+      return;
+    }
+
+    if (options.add) {
+      const name = await promptInput('Job name');
+      const schedule = await promptInput('Cron schedule (e.g. */5 * * * *)');
+      const message = await promptInput('Message to send');
+      const sessionId = await promptInput('Session ID (optional)', 'main');
+
+      const job = store.addJob({
+        name,
+        schedule,
+        message,
+        sessionId: sessionId || undefined,
+        enabled: true,
+      } as Omit<CronJob, 'id' | 'createdAt' | 'updatedAt'>);
+      console.log(chalk.green(`✅ Added job ${job.id}`));
+      return;
+    }
+
+    if (options.update) {
+      const jobId = String(options.update);
+      const existing = store.getJob(jobId);
+      if (!existing) {
+        console.log(chalk.red('❌ Job not found.'));
+        return;
+      }
+
+      const name = await promptInput('Job name', existing.name);
+      const schedule = await promptInput('Cron schedule', existing.schedule);
+      const message = await promptInput('Message to send', existing.message);
+      const sessionId = await promptInput('Session ID', existing.sessionId || 'main');
+      const enabledAnswer = await promptInput('Enabled (true/false)', String(existing.enabled));
+      const enabled = enabledAnswer.toLowerCase() === 'true';
+
+      const job = store.updateJob(jobId, {
+        name,
+        schedule,
+        message,
+        sessionId: sessionId || undefined,
+        enabled,
+      });
+      console.log(chalk.green(`✅ Updated job ${job?.id}`));
+      return;
+    }
+
+    if (options.delete) {
+      const deleted = store.deleteJob(String(options.delete));
+      if (!deleted) {
+        console.log(chalk.red('❌ Job not found.'));
+        return;
+      }
+      console.log(chalk.green('✅ Job deleted.'));
+      return;
+    }
+
+    if (options.enable) {
+      const job = store.updateJob(String(options.enable), { enabled: true });
+      if (!job) {
+        console.log(chalk.red('❌ Job not found.'));
+        return;
+      }
+      console.log(chalk.green('✅ Job enabled.'));
+      return;
+    }
+
+    if (options.disable) {
+      const job = store.updateJob(String(options.disable), { enabled: false });
+      if (!job) {
+        console.log(chalk.red('❌ Job not found.'));
+        return;
+      }
+      console.log(chalk.green('✅ Job disabled.'));
+      return;
+    }
+
+    if (options.trigger) {
+      const job = store.getJob(String(options.trigger));
+      if (!job) {
+        console.log(chalk.red('❌ Job not found.'));
+        return;
+      }
+      console.log(chalk.yellow('Triggering job via API is recommended. Use /api/cron/jobs/:id/trigger.'));
+      return;
+    }
+
+    console.log(chalk.bold('⏰ Cron Jobs'));
+    console.log(chalk.gray('─'.repeat(60)));
+    console.log(chalk.gray('Usage:'));
+    console.log(`  ${chalk.cyan('claw-lite cron --list')} - List jobs`);
+    console.log(`  ${chalk.cyan('claw-lite cron --add')} - Add job`);
+    console.log(`  ${chalk.cyan('claw-lite cron --update <id>')} - Update job`);
+    console.log(`  ${chalk.cyan('claw-lite cron --delete <id>')} - Delete job`);
+    console.log(`  ${chalk.cyan('claw-lite cron --enable <id>')} - Enable job`);
+    console.log(`  ${chalk.cyan('claw-lite cron --disable <id>')} - Disable job`);
+    console.log(`  ${chalk.cyan('claw-lite cron --runs')} - List runs`);
+  });
+
 // Skills command
 program
   .command('skills')
@@ -732,14 +1254,25 @@ program
   .option('-i, --install <path>', 'Install and verify a skill from local path')
   .option('-u, --uninstall <name>', 'Uninstall a skill')
   .option('-s, --scan <path>', 'Scan a skill directory for safety issues')
+  .option('--registry-list', 'List skills available in registry')
+  .option('--registry-install <name>', 'Install a skill from registry (name or name@version)')
+  .option('--activate <name>', 'Activate an installed skill (name or name@version)')
+  .option('--deactivate <name>', 'Deactivate an installed skill')
+  .option('--status', 'Show active skills')
   .action(async (options) => {
     const configManager = await initializeConfig();
     const workspace = configManager.getWorkspacePath();
     const skillsPath = join(workspace, 'skills');
     const credentialManager = await getCredentialManager();
+    const activationStore = new SkillActivationStore(configManager.getConfigPath());
     
     const { SkillVerifier } = await import('../security/skill-verifier.js');
     const verifier = new SkillVerifier(skillsPath, credentialManager || undefined);
+    const registryClient = new SkillRegistryClient(
+      configManager.getConfig().skills.registryUrl,
+      join(configManager.getConfigPath(), 'skills-registry.json')
+    );
+    await registryClient.loadCache();
     
     if (options.list) {
       const skills = verifier.listSkills();
@@ -762,6 +1295,126 @@ program
         console.log(`  ${chalk.gray('Installed:')} ${date}`);
         console.log(`  ${chalk.gray('Verified:')} ${skill.verified ? 'Yes' : 'No'}`);
         console.log();
+      });
+      return;
+    }
+
+    if (options.registryList) {
+      try {
+        const skills = await registryClient.listSkills();
+        if (skills.length === 0) {
+          console.log(chalk.gray('No registry skills found.'));
+          return;
+        }
+
+        console.log(chalk.bold('🧩 Registry Skills'));
+        console.log(chalk.gray('─'.repeat(60)));
+        skills.forEach(skill => {
+          const description = skill.description ? ` - ${skill.description}` : '';
+          console.log(`${chalk.cyan(skill.name)}@${skill.version}${description}`);
+        });
+      } catch (error) {
+        console.log(chalk.red(`❌ Failed to list registry skills: ${error instanceof Error ? error.message : String(error)}`));
+      }
+      return;
+    }
+
+    if (options.registryInstall) {
+      const spec = String(options.registryInstall);
+      const [namePart, versionPart] = spec.split('@');
+      const name = namePart.trim();
+      const version = versionPart ? versionPart.trim() : undefined;
+      const registryConfig = configManager.getConfig().skills;
+
+      if (!registryConfig.registryUrl) {
+        console.log(chalk.red('❌ Registry URL not configured. Set skills.registryUrl first.'));
+        return;
+      }
+
+      if (!registryConfig.allowUnlisted && registryConfig.allowlist.length > 0 && !registryConfig.allowlist.includes(name)) {
+        console.log(chalk.red(`❌ Skill "${name}" is not allowlisted.`));
+        return;
+      }
+
+      try {
+        const registrySkill = await registryClient.findSkill(name, version);
+        if (!registrySkill) {
+          console.log(chalk.red(`❌ Skill "${spec}" not found in registry.`));
+          return;
+        }
+
+        const files = await registryClient.resolveSkillFiles(registrySkill);
+        const tempDir = join(configManager.getConfigPath(), 'skills-cache', `${registrySkill.name}-${registrySkill.version}`);
+        await fs.mkdir(tempDir, { recursive: true });
+
+        for (const file of files) {
+          const filePath = join(tempDir, file.path);
+          await fs.mkdir(path.dirname(filePath), { recursive: true });
+          const content = file.encoding === 'base64'
+            ? Buffer.from(file.content, 'base64')
+            : file.content;
+          await fs.writeFile(filePath, content, 'utf-8');
+        }
+
+        if (!files.find(file => file.path === 'manifest.json')) {
+          const manifest = {
+            name: registrySkill.name,
+            version: registrySkill.version,
+            description: registrySkill.description,
+            entryPoint: registrySkill.entryPoint || 'index.js',
+          };
+          await fs.writeFile(join(tempDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8');
+        }
+
+        const result = verifier.installSkill(tempDir, registrySkill.name, registryConfig.registryUrl);
+        console.log(chalk.green(`✅ Installed ${registrySkill.name}@${registrySkill.version}`));
+        console.log(chalk.gray(`   Files: ${result.fileCount}`));
+
+        if (registryConfig.autoActivate) {
+          activationStore.activate(registrySkill.name, registrySkill.version);
+          console.log(chalk.gray('   Activated skill')); 
+        }
+      } catch (error) {
+        console.log(chalk.red(`❌ Failed to install from registry: ${error instanceof Error ? error.message : String(error)}`));
+      }
+      return;
+    }
+
+    if (options.activate) {
+      const spec = String(options.activate);
+      const [namePart, versionPart] = spec.split('@');
+      const name = namePart.trim();
+      const manifest = verifier.getSkill(name);
+
+      if (!manifest) {
+        console.log(chalk.red(`❌ Skill "${name}" is not installed.`));
+        return;
+      }
+
+      const version = versionPart ? versionPart.trim() : manifest.version;
+      activationStore.activate(name, version);
+      console.log(chalk.green(`✅ Activated ${name}@${version}`));
+      return;
+    }
+
+    if (options.deactivate) {
+      const name = String(options.deactivate).trim();
+      activationStore.deactivate(name);
+      console.log(chalk.green(`✅ Deactivated ${name}`));
+      return;
+    }
+
+    if (options.status) {
+      const active = activationStore.listActive();
+      if (active.length === 0) {
+        console.log(chalk.gray('No active skills.'));
+        return;
+      }
+
+      console.log(chalk.bold('Active Skills'));
+      console.log(chalk.gray('─'.repeat(60)));
+      active.forEach(skill => {
+        console.log(`${chalk.cyan(skill.name)}@${skill.version}`);
       });
       return;
     }

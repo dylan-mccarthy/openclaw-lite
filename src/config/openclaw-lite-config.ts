@@ -47,6 +47,14 @@ export const OpenClawLiteConfigSchema = z.object({
     enableCors: z.boolean().default(true),
     maxContextTokens: z.number().positive().default(8192),
   }),
+
+  // Gateway control plane configuration
+  gateway: z.object({
+    enabled: z.boolean().default(true),
+    wsPath: z.string().default('/gateway'),
+    authToken: z.string().default(''),
+    allowUnauthenticated: z.boolean().default(false),
+  }).default({}),
   
   // Agent configuration
   agent: z.object({
@@ -55,6 +63,37 @@ export const OpenClawLiteConfigSchema = z.object({
     timeoutMs: z.number().positive().default(120000),
     maxToolCallsPerTurn: z.number().positive().default(10),
   }),
+
+  // Skills platform configuration
+  skills: z.object({
+    registryUrl: z.string().default(''),
+    allowlist: z.array(z.string()).default([]),
+    allowUnlisted: z.boolean().default(false),
+    autoActivate: z.boolean().default(true),
+  }).default({}),
+
+  // Cron jobs configuration
+  cron: z.object({
+    enabled: z.boolean().default(true),
+    runHistoryLimit: z.number().int().positive().default(50),
+  }).default({}),
+
+  // Telegram integration
+  telegram: z.object({
+    enabled: z.boolean().default(false),
+    botToken: z.string().default(''),
+    botUsername: z.string().default(''),
+    mode: z.enum(['polling', 'webhook']).default('polling'),
+    pollingIntervalMs: z.number().positive().default(2000),
+    webhookUrl: z.string().default(''),
+    webhookPath: z.string().default('/api/telegram/webhook'),
+    allowFrom: z.array(z.string()).default([]),
+    groupAllowFrom: z.array(z.string()).default([]),
+    requireMentionInGroups: z.boolean().default(true),
+    pairingEnabled: z.boolean().default(true),
+    pairingCodeLength: z.number().int().min(4).max(8).default(6),
+    pairingTtlMinutes: z.number().int().positive().default(10),
+  }).default({}),
 });
 
 export type OpenClawLiteConfig = z.infer<typeof OpenClawLiteConfigSchema>;
@@ -78,7 +117,11 @@ export class OpenClawLiteConfigManager {
       ollama: {},
       memory: {},
       web: {},
-      agent: {}
+      gateway: {},
+      agent: {},
+      telegram: {},
+      skills: {},
+      cron: {}
     });
   }
   
@@ -148,7 +191,11 @@ export class OpenClawLiteConfigManager {
       ollama: {},
       memory: {},
       web: {},
+      gateway: {},
       agent: {},
+      telegram: {},
+      skills: {},
+      cron: {},
     });
   }
   
